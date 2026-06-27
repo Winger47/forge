@@ -45,9 +45,23 @@ class DirectClient:
             temperature=0,
         )
         return response
+class GatewayClient:
+    """Same interface as DirectClient — but calls OUR gateway, not Groq directly."""
+    def __init__(self):
+        self.client = OpenAI(
+            api_key="not-needed-yet",                     # gateway handles the real key
+            base_url="http://127.0.0.1:8000/v1",          # ← OUR gateway, not Groq
+        )
 
+    def create(self, messages, tools):
+        response = self.client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            tools=tools,
+            temperature=0,
+        )
+        return response
 
-# ─────────────────────────────────────────────
 # 2. THE TOOLS (the agent's hands)
 # ─────────────────────────────────────────────
 def read_file(path):
@@ -188,7 +202,7 @@ def run_agent(goal,client: LLMClient, max_iterations=10, max_tokens=50000):
 # ─────────────────────────────────────────────
 def main():
     goal = input("goal> ")
-    client = DirectClient()              
+    client = GatewayClient()              
 
     for event in run_agent(goal,client):
         if event.type == "status":
