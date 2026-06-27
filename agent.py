@@ -8,6 +8,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from typing import Protocol
 
 load_dotenv()   # read .env so GROQ_API_KEY is available
 
@@ -19,6 +20,11 @@ load_dotenv()   # read .env so GROQ_API_KEY is available
 class Event:
     type: str          # "status" | "tool_call" | "tool_result" | "text" | "cost"
     data: dict[str, Any]
+
+class LLMClient(Protocol):
+    """The contract the agent depends on. Anything with this method is an LLMClient."""
+    def create(self, messages: list, tools: list): ...
+
 
 
 # ─────────────────────────────────────────────
@@ -116,8 +122,8 @@ TOOL_SCHEMAS = [
 # ─────────────────────────────────────────────
 # 3. THE LOOP (think → act → look → repeat)
 # ─────────────────────────────────────────────
-def run_agent(goal, max_iterations=10, max_tokens=100):
-    client = DirectClient()
+def run_agent(goal,client: LLMClient, max_iterations=10, max_tokens=50000):
+    # client = DirectClient()
     total_tokens = 0          # state for THIS run — local, not global
     messages = [
         {"role": "system", "content": (
@@ -182,7 +188,9 @@ def run_agent(goal, max_iterations=10, max_tokens=100):
 # ─────────────────────────────────────────────
 def main():
     goal = input("goal> ")
-    for event in run_agent(goal):
+    client = DirectClient()              
+
+    for event in run_agent(goal,client):
         if event.type == "status":
             reason = event.data.get("reason", "")
             print(f"[status: {event.data['phase']} {event.data.get('n', '')} {reason}]".rstrip())
