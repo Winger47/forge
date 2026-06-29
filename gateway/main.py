@@ -38,7 +38,7 @@ async def chat_completions(request: Request):
         print("CACHE HIT", key)      # ← Add this line
         return json.loads(cached)
     prompt = get_prompt_text(body)
-    print(f"   [embedding prompt: {prompt[:80]}]")     
+    print(f"   [embedding prompt: {prompt[:80]}]") 
     query_vec = embedder.encode(prompt)
 
     for entry in semantic_store:
