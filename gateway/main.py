@@ -10,6 +10,8 @@ from openai import OpenAI
 from sentence_transformers import SentenceTransformer, util
 import redis
 
+from gateway.rate_limit import BUCKET_LUA
+
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 app = FastAPI()
@@ -31,37 +33,7 @@ cache = redis.Redis(host="localhost", port=6379, decode_responses=True)
 RATE_CAPACITY = 10           # max burst (bucket size)
 RATE_REFILL_PER_SEC = 1.0    # steady-state refill rate
 
-# Token-bucket as an atomic Lua script — read, refill, consume, write happen as ONE
-# indivisible operation, so concurrent requests can't both consume the last token.
-_BUCKET_LUA = """
-local key      = KEYS[1]
-local capacity = tonumber(ARGV[1])
-local refill   = tonumber(ARGV[2])
-local now      = tonumber(ARGV[3])
-
-local data   = redis.call('HMGET', key, 'tokens', 'ts')
-local tokens = tonumber(data[1])
-local ts     = tonumber(data[2])
-
-if tokens == nil then
-    tokens = capacity
-    ts     = now
-end
-
-local elapsed = math.max(0, now - ts)
-tokens = math.min(capacity, tokens + elapsed * refill)
-
-local allowed = 0
-if tokens >= 1 then
-    tokens = tokens - 1
-    allowed = 1
-end
-
-redis.call('HMSET', key, 'tokens', tokens, 'ts', now)
-redis.call('EXPIRE', key, 3600)
-return allowed
-"""
-_rate_script = cache.register_script(_BUCKET_LUA)
+_rate_script = cache.register_script(BUCKET_LUA)
 
 
 def check_rate_limit(client_id: str) -> bool:
