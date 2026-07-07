@@ -18,7 +18,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 # ─────────────────────────────────────────────
 @dataclass
 class Event:
-    type: str          # "status" | "tool_call" | "tool_result" | "text" | "cost"
+    type: str          # "status" | "tool_call" | "tool_result" | "text" | "cost" | "confirm_request"
     data: dict[str, Any]
 
 
@@ -81,6 +81,8 @@ def run_shell(command):
     return (result.stdout + result.stderr).strip() or "(no output)"
 
 
+DANGEROUS_TOOLS = {"run_shell", "write_file"}   # tools that can cause harm → need approval
+
 TOOLS = {
     "read_file": read_file,
     "write_file": write_file,
@@ -139,7 +141,8 @@ TOOL_SCHEMAS = [
 # ─────────────────────────────────────────────
 def run_agent(goal, client: LLMClient, max_iterations=10, max_tokens=50000):
     total_tokens = 0
-    last_call = None                     # NEW: track the previous tool call to detect loops
+    last_call = None
+    rejected_streak = 0          # ← Part A: initialize HERE, with the other loop state
     messages = [
         {"role": "system", "content": (
             "You are an agent with access to tools: read_file, write_file, run_shell. "
@@ -147,9 +150,9 @@ def run_agent(goal, client: LLMClient, max_iterations=10, max_tokens=50000):
             "appropriate tool to get real data. Do NOT guess or describe what a file might "
             "contain — call read_file and read it. Only give a final answer after you have "
             "used the tools you need. "
-            "If a tool fails or returns empty output, do not keep retrying the same command. "
-            "Either try a different approach or give your best answer based on what you know, "
-            "explaining any limitation."
+            "If a tool fails, is denied, or returns empty output, do NOT retry the same "
+            "command. Either try a different approach or give your final answer, explaining "
+            "any limitation."
         )},
         {"role": "user", "content": goal},
     ]
@@ -173,7 +176,7 @@ def run_agent(goal, client: LLMClient, max_iterations=10, max_tokens=50000):
             yield Event("text", {"content": msg.content})
             return
 
-        # --- ACT: record the assistant message WITH its tool_calls, then run each tool ---
+        # --- ACT ---
         messages.append({
             "role": "assistant",
             "content": msg.content,
@@ -182,46 +185,64 @@ def run_agent(goal, client: LLMClient, max_iterations=10, max_tokens=50000):
 
         for tc in msg.tool_calls:
             name = tc.function.name
-            args = json.loads(tc.function.arguments)   # args arrive as a JSON STRING → parse to dict
-            yield Event("tool_call", {"name": name, "args": args})
-
-            # --- NEW GUARD: break repeated identical calls (enforced in CODE, not prose) ---
+            args = json.loads(tc.function.arguments)
             call_signature = f"{name}:{json.dumps(args, sort_keys=True)}"
+
+            # --- GUARD FIRST: catch repeats BEFORE bothering the human ---
             if call_signature == last_call:
-                result = ("You already ran this exact command and it did not help. "
-                          "Do NOT run it again. Give your best final answer from your own "
-                          "knowledge instead, noting you couldn't retrieve it via tools.")
+                rejected_streak += 1                          # ← Part B: increment HERE
+                if rejected_streak >= 2:                      # stuck → force-terminate the whole run
+                    yield Event("status", {"phase": "aborted", "reason": "stuck: repeated rejected call"})
+                    return
+                result = ("You already requested this exact action and it was handled "
+                          "(run or denied). Do NOT request it again. Give your final answer.")
                 yield Event("tool_result", {"name": name, "content": result})
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                 last_call = call_signature
                 continue
+
+            rejected_streak = 0        # ← Part B: reset when the model does something NEW
+
+            # --- THEN permission gate for dangerous tools ---
+            if name in DANGEROUS_TOOLS:
+                decision = yield Event("confirm_request", {"name": name, "args": args})
+                if decision != "yes":
+                    result = (f"DENIED by user: {name} was not run. "
+                              "Do not request this same action again.")
+                    yield Event("tool_result", {"name": name, "content": result})
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                    last_call = call_signature
+                    continue
+
+            yield Event("tool_call", {"name": name, "args": args})
             last_call = call_signature
 
-            # --- run the tool ---
             try:
                 result = TOOLS[name](**args)
             except Exception as e:
-                result = f"ERROR: {type(e).__name__}: {e}"   # tool failure = data, not a crash
+                result = f"ERROR: {type(e).__name__}: {e}"
             yield Event("tool_result", {"name": name, "content": result})
-
-            # --- LOOK: feed the result back so the AI sees it next turn ---
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result,
-            })
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     yield Event("status", {"phase": "aborted", "reason": "max iterations"})
-
-
 # ─────────────────────────────────────────────
-# 4. ENTRY POINT (the only thing that prints)
+# 4. ENTRY POINT (drives the generator with .send() so it can answer confirm requests)
 # ─────────────────────────────────────────────
 def main():
     goal = input("goal> ")
     client = GatewayClient()
 
-    for event in run_agent(goal, client):
+    agent = run_agent(goal, client)     # the generator (not started yet)
+    to_send = None                      # what we pass back on the next .send()
+
+    while True:
+        try:
+            event = agent.send(to_send)   # advance; first send MUST be None (generator not started)
+        except StopIteration:
+            break                          # generator finished → done
+
+        to_send = None                     # reset; only set it when answering a confirm
+
         if event.type == "status":
             reason = event.data.get("reason", "")
             print(f"[status: {event.data['phase']} {event.data.get('n', '')} {reason}]".rstrip())
@@ -233,6 +254,12 @@ def main():
             print(f"  [tokens so far: {event.data['total_tokens']}]")
         elif event.type == "text":
             print(f"\n{event.data['content']}")
+        elif event.type == "confirm_request":
+            name = event.data["name"]
+            args = event.data["args"]
+            print(f"\n⚠️  Agent wants to run: {name}({args})")
+            answer = input("    Approve? [yes/no]: ").strip().lower()
+            to_send = "yes" if answer in ("yes", "y") else "no"
 
 
 if __name__ == "__main__":
