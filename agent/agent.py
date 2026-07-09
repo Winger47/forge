@@ -67,7 +67,6 @@ class GatewayClient:
 
 # ─────────────────────────────────────────────
 # 2. TOOLS — defined once in tools.py via @tool() decorator
-#    agent.py uses: get_schemas(), get_tool(name), is_dangerous(name), get_tool_names()
 # ─────────────────────────────────────────────
 
 
@@ -98,8 +97,8 @@ def build_system_prompt():
 
 # ─────────────────────────────────────────────
 # 3. THE LOOP (think → act → look → repeat)
-#    messages is OWNED BY THE SESSION and passed in — the loop mutates it in place
-#    so the conversation survives across turns.
+#    messages is OWNED BY THE SESSION and passed in — mutated in place so the
+#    conversation survives across turns.
 # ─────────────────────────────────────────────
 def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
     total_tokens = 0
@@ -121,7 +120,6 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
 
         # --- DONE? no tool call means the AI is finished ---
         if not msg.tool_calls:
-            # append the answer so the NEXT turn remembers what we said
             messages.append({"role": "assistant", "content": msg.content})
             yield Event("text", {"content": msg.content})
             return
@@ -148,13 +146,12 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
                         "using the information you already have."
                     ),
                 })
-                # forced answer is context-specific -> must NOT be cached
-                fresh_client = GatewayClient(bypass_cache=True)
+                fresh_client = GatewayClient(bypass_cache=True)   # forced answer -> not cached
                 forced = fresh_client.create(messages, [])
                 total_tokens += forced.usage.total_tokens
                 yield Event("cost", {"total_tokens": total_tokens})
                 answer = forced.choices[0].message.content
-                messages.append({"role": "assistant", "content": answer})   # remember for next turn
+                messages.append({"role": "assistant", "content": answer})
                 yield Event("text", {"content": answer})
                 return
 
@@ -180,6 +177,42 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     yield Event("status", {"phase": "aborted", "reason": "max iterations"})
+
+
+# ─────────────────────────────────────────────
+#  COMPACTION — keep the conversation from growing unbounded.
+#  The context window is a finite cache; summarize old turns, keep recent ones.
+#  Threshold is high so it only fires on genuinely long sessions (not every turn).
+# ─────────────────────────────────────────────
+def compact(messages, client, keep_recent=6, threshold=40):
+    """If the conversation is long, summarize the older turns into one message.
+    Keeps the system prompt and the most recent turns verbatim.
+    Returns a new (shorter) messages list, or the original if no compaction needed."""
+
+    if len(messages) <= threshold:
+        return messages
+
+    system = messages[0]                      # always keep the system prompt
+    recent = messages[-keep_recent:]          # keep the last few messages verbatim
+    to_summarize = messages[1:-keep_recent]   # the middle — old turns to compress
+
+    if not to_summarize:
+        return messages
+
+    summary_request = [
+        {"role": "system", "content": "Summarize the following conversation history concisely, "
+                                      "preserving key facts, decisions, file contents, and tool "
+                                      "results the user might refer back to. Be brief."},
+        {"role": "user", "content": json.dumps(to_summarize)},
+    ]
+    resp = client.create(summary_request, [])   # no tools needed for summarizing
+    summary_text = resp.choices[0].message.content
+
+    summary_msg = {
+        "role": "system",
+        "content": f"[Summary of earlier conversation]\n{summary_text}",
+    }
+    return [system, summary_msg] + recent
 
 
 # ─────────────────────────────────────────────
@@ -222,6 +255,9 @@ def main():
 
         # add the new goal to the SAME history, so the agent remembers prior turns
         messages.append({"role": "user", "content": goal})
+
+        # compact if the conversation has grown long (summary call must bypass cache)
+        messages = compact(messages, GatewayClient(bypass_cache=True))
 
         client = GatewayClient()
         agent = run_agent(messages, client)     # pass the shared conversation IN
