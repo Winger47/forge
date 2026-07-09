@@ -132,7 +132,6 @@ def run_agent(goal, client: LLMClient, max_iterations=10, max_tokens=50000):
             args = json.loads(tc.function.arguments)
             call_signature = f"{name}:{json.dumps(args, sort_keys=True)}"
 
-            # --- GUARD FIRST: catch repeats BEFORE bothering the human ---
             if call_signature == last_call:
                 messages.append({
                     "role": "user",
@@ -142,7 +141,9 @@ def run_agent(goal, client: LLMClient, max_iterations=10, max_tokens=50000):
                         "using the information you already have."
                     ),
                 })
-                forced = client.create(messages, [])
+                # forced answer is context-specific → must NOT be cached
+                fresh_client = GatewayClient(bypass_cache=True)
+                forced = fresh_client.create(messages, [])
                 total_tokens += forced.usage.total_tokens
                 yield Event("cost", {"total_tokens": total_tokens})
                 yield Event("text", {"content": forced.choices[0].message.content})
