@@ -1,5 +1,3 @@
-
-
 import os
 import json
 from pathlib import Path
@@ -10,7 +8,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv(Path(__file__).parent.parent / ".env")
-    
+
 
 # ─────────────────────────────────────────────
 # EVENTS (the agent announces; it never prints)
@@ -57,49 +55,55 @@ class GatewayClient:
         )
 
     def create(self, messages, tools):
-        # forward the bypass header only when regenerating
         extra_headers = {"Cache-Control": "no-cache"} if self.bypass_cache else {}
         return self.client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=messages,
             tools=tools,
             temperature=0,
-            extra_headers=extra_headers,   # OpenAI SDK forwards custom headers to the gateway
+            extra_headers=extra_headers,
         )
 
 
 # ─────────────────────────────────────────────
 # 2. TOOLS — defined once in tools.py via @tool() decorator
-#    agent.py uses: get_schemas(), get_tool(name), is_dangerous(name)
+#    agent.py uses: get_schemas(), get_tool(name), is_dangerous(name), get_tool_names()
 # ─────────────────────────────────────────────
 
 
-# ─────────────────────────────────────────────
-# 3. THE LOOP (think → act → look → repeat)
-# ─────────────────────────────────────────────
-def run_agent(goal, client: LLMClient, max_iterations=10, max_tokens=50000):
-    total_tokens = 0
-    last_call = None
-    rejected_streak = 0          # ← Part A: initialize HERE, with the other loop state
+def build_system_prompt():
+    """The system message. Built from the live tool registry so it never drifts."""
     tool_names = ", ".join(get_tool_names())
-    messages = [
-        {"role": "system", "content": (
+    return {
+        "role": "system",
+        "content": (
             f"You are a task-completing agent with access to these tools: {tool_names}.\n\n"
             "HOW TO WORK:\n"
             "- When a task needs real data about files or the system, call the appropriate "
             "tool to get it. Do NOT guess or make up file contents — use a tool.\n"
             "- After a tool returns its result, READ the result and decide: do you now have "
             "enough to answer the user's goal?\n"
-            "- If YES: stop calling tools and write your final answer to the user directly, "
-            "using the information the tool gave you. Do NOT call the same tool again.\n"
+            "- If YES: stop calling tools and write your final answer directly. Do NOT call "
+            "the same tool again.\n"
             "- If NO: call another tool to get what's still missing.\n\n"
             "IMPORTANT: Once you have the information you need, you MUST give a final text "
             "answer instead of calling more tools. Repeating a tool you already ran will not "
-            "give new information. If a tool fails or is denied, do not retry it — either try "
-            "a different approach or give your best answer explaining the limitation."
-        )},
-        {"role": "user", "content": goal},
-    ]
+            "give new information. If a tool fails or is denied, do not retry it.\n\n"
+            "This is a MULTI-TURN conversation — the user may ask follow-up questions that "
+            "refer to earlier context (e.g. 'which of those is largest?'). Use the "
+            "conversation history to resolve such references."
+        ),
+    }
+
+
+# ─────────────────────────────────────────────
+# 3. THE LOOP (think → act → look → repeat)
+#    messages is OWNED BY THE SESSION and passed in — the loop mutates it in place
+#    so the conversation survives across turns.
+# ─────────────────────────────────────────────
+def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
+    total_tokens = 0
+    last_call = None
 
     for i in range(max_iterations):
         yield Event("status", {"phase": "iteration", "n": i})
@@ -117,10 +121,12 @@ def run_agent(goal, client: LLMClient, max_iterations=10, max_tokens=50000):
 
         # --- DONE? no tool call means the AI is finished ---
         if not msg.tool_calls:
+            # append the answer so the NEXT turn remembers what we said
+            messages.append({"role": "assistant", "content": msg.content})
             yield Event("text", {"content": msg.content})
             return
 
-        # --- ACT ---
+        # --- ACT: record the assistant tool-call message ---
         messages.append({
             "role": "assistant",
             "content": msg.content,
@@ -132,6 +138,7 @@ def run_agent(goal, client: LLMClient, max_iterations=10, max_tokens=50000):
             args = json.loads(tc.function.arguments)
             call_signature = f"{name}:{json.dumps(args, sort_keys=True)}"
 
+            # --- GUARD: on a repeat, FORCE a final answer (remove ability to loop) ---
             if call_signature == last_call:
                 messages.append({
                     "role": "user",
@@ -141,17 +148,17 @@ def run_agent(goal, client: LLMClient, max_iterations=10, max_tokens=50000):
                         "using the information you already have."
                     ),
                 })
-                # forced answer is context-specific → must NOT be cached
+                # forced answer is context-specific -> must NOT be cached
                 fresh_client = GatewayClient(bypass_cache=True)
                 forced = fresh_client.create(messages, [])
                 total_tokens += forced.usage.total_tokens
                 yield Event("cost", {"total_tokens": total_tokens})
-                yield Event("text", {"content": forced.choices[0].message.content})
+                answer = forced.choices[0].message.content
+                messages.append({"role": "assistant", "content": answer})   # remember for next turn
+                yield Event("text", {"content": answer})
                 return
 
-            rejected_streak = 0        # ← Part B: reset when the model does something NEW
-
-            # --- THEN permission gate for dangerous tools ---
+            # --- permission gate for dangerous tools ---
             if is_dangerous(name):
                 decision = yield Event("confirm_request", {"name": name, "args": args})
                 if decision != "yes":
@@ -168,54 +175,75 @@ def run_agent(goal, client: LLMClient, max_iterations=10, max_tokens=50000):
             try:
                 result = get_tool(name)(**args)
             except Exception as e:
-                result = f"ERROR: {type(e).__name__}: {e}"
+                result = f"ERROR: {type(e).__name__}: {e}"   # tool failure = data, not a crash
             yield Event("tool_result", {"name": name, "content": result})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     yield Event("status", {"phase": "aborted", "reason": "max iterations"})
+
+
 # ─────────────────────────────────────────────
-# 4. ENTRY POINT (drives the generator with .send() so it can answer confirm requests)
+# 4. ENTRY POINT — owns the conversation; loops per user goal (multi-turn session)
 # ─────────────────────────────────────────────
+def _render(event):
+    """Render one event to the terminal. The ONLY place that prints."""
+    if event.type == "status":
+        reason = event.data.get("reason", "")
+        print(f"[status: {event.data['phase']} {event.data.get('n', '')} {reason}]".rstrip())
+    elif event.type == "tool_call":
+        print(f"  -> {event.data['name']}({event.data['args']})")
+    elif event.type == "tool_result":
+        print(f"  <- {event.data['content'][:200]}")
+    elif event.type == "cost":
+        print(f"  [tokens so far: {event.data['total_tokens']}]")
+    elif event.type == "text":
+        print(f"\n{event.data['content']}")
+
+
 def main():
-    goal = input("goal> ")
-    bypass = False                          # first run uses the cache normally
+    messages = [build_system_prompt()]      # THE CONVERSATION — created once, survives across goals
 
-    while True:                             # OUTER loop = re-run on regenerate
-        client = GatewayClient(bypass_cache=bypass)
-        agent = run_agent(goal, client)
+    print("FORGE — enter a goal. Commands: /exit  /clear  /tools\n")
+
+    while True:                     # SESSION loop — one iteration per user goal
+        goal = input("goal> ").strip()
+
+        if goal in ("/exit", "/quit"):
+            break
+        if goal == "/clear":
+            messages = [build_system_prompt()]
+            print("(conversation cleared)\n")
+            continue
+        if goal == "/tools":
+            print("  tools: " + ", ".join(get_tool_names()) + "\n")
+            continue
+        if not goal:
+            continue
+
+        # add the new goal to the SAME history, so the agent remembers prior turns
+        messages.append({"role": "user", "content": goal})
+
+        client = GatewayClient()
+        agent = run_agent(messages, client)     # pass the shared conversation IN
         to_send = None
-
-        while True:                         # INNER loop = drive the agent generator
+        while True:                             # drive the agent generator
             try:
                 event = agent.send(to_send)
             except StopIteration:
                 break
             to_send = None
 
-            if event.type == "status":
-                reason = event.data.get("reason", "")
-                print(f"[status: {event.data['phase']} {event.data.get('n', '')} {reason}]".rstrip())
-            elif event.type == "tool_call":
-                print(f"  → {event.data['name']}({event.data['args']})")
-            elif event.type == "tool_result":
-                print(f"  ← {event.data['content'][:200]}")
-            elif event.type == "cost":
-                print(f"  [tokens so far: {event.data['total_tokens']}]")
-            elif event.type == "text":
-                print(f"\n{event.data['content']}")
-            elif event.type == "confirm_request":
+            if event.type == "confirm_request":
                 name = event.data["name"]
                 args = event.data["args"]
-                print(f"\n⚠️  Agent wants to run: {name}({args})")
+                print(f"\n[!] Agent wants to run: {name}({args})")
                 answer = input("    Approve? [yes/no]: ").strip().lower()
                 to_send = "yes" if answer in ("yes", "y") else "no"
+            else:
+                _render(event)
 
-        # --- after the agent finishes: ask if the user is satisfied ---
-        choice = input("\nSatisfied? [enter = yes / r = regenerate]: ").strip().lower()
-        if choice != "r":
-            break                           # user is happy → exit
-        bypass = True                       # next run bypasses the cache → fresh answer
-        print("\nregenerating (fresh answer)...\n")
+        print()   # blank line between turns
+
 
 if __name__ == "__main__":
     main()
