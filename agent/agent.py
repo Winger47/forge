@@ -6,8 +6,13 @@ from typing import Any, Protocol
 from agent.tools import get_schemas, get_tool, is_dangerous, get_tool_names
 from dotenv import load_dotenv
 from openai import OpenAI
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
 
 load_dotenv(Path(__file__).parent.parent / ".env")
+
+console = Console()
 
 
 # ─────────────────────────────────────────────
@@ -182,19 +187,17 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
 # ─────────────────────────────────────────────
 #  COMPACTION — keep the conversation from growing unbounded.
 #  The context window is a finite cache; summarize old turns, keep recent ones.
-#  Threshold is high so it only fires on genuinely long sessions (not every turn).
 # ─────────────────────────────────────────────
-def compact(messages, client, keep_recent=6, threshold=6):
+def compact(messages, client, keep_recent=6, threshold=40):
     """If the conversation is long, summarize the older turns into one message.
-    Keeps the system prompt and the most recent turns verbatim.
-    Returns a new (shorter) messages list, or the original if no compaction needed."""
+    Keeps the system prompt and the most recent turns verbatim."""
 
     if len(messages) <= threshold:
         return messages
 
-    system = messages[0]                      # always keep the system prompt
-    recent = messages[-keep_recent:]          # keep the last few messages verbatim
-    to_summarize = messages[1:-keep_recent]   # the middle — old turns to compress
+    system = messages[0]
+    recent = messages[-keep_recent:]
+    to_summarize = messages[1:-keep_recent]
 
     if not to_summarize:
         return messages
@@ -205,8 +208,7 @@ def compact(messages, client, keep_recent=6, threshold=6):
                                       "results the user might refer back to. Be brief."},
         {"role": "user", "content": json.dumps(to_summarize)},
     ]
-    resp = client.create(summary_request, []) 
-    print(f"  [COMPACTING: {len(messages)} messages -> summary + {keep_recent} recent]")  # no tools needed for summarizing
+    resp = client.create(summary_request, [])
     summary_text = resp.choices[0].message.content
 
     summary_msg = {
@@ -217,39 +219,67 @@ def compact(messages, client, keep_recent=6, threshold=6):
 
 
 # ─────────────────────────────────────────────
-# 4. ENTRY POINT — owns the conversation; loops per user goal (multi-turn session)
+# 4. PRESENTATION — rich rendering. The ONLY place that prints.
+#    The agent yields plain Event objects; this decides how they LOOK.
+#    Swapping plain print() for rich touched only this layer — the loop is unchanged.
 # ─────────────────────────────────────────────
 def _render(event):
-    """Render one event to the terminal. The ONLY place that prints."""
+    """Render one event with rich styling."""
     if event.type == "status":
+        phase = event.data["phase"]
+        n = event.data.get("n", "")
         reason = event.data.get("reason", "")
-        print(f"[status: {event.data['phase']} {event.data.get('n', '')} {reason}]".rstrip())
+        if phase == "aborted":
+            console.print(f"[dim red]! aborted: {reason}[/dim red]")
+        else:
+            console.print(f"[dim]. iteration {n}[/dim]")
+
     elif event.type == "tool_call":
-        print(f"  -> {event.data['name']}({event.data['args']})")
+        name = event.data["name"]
+        args = event.data["args"]
+        console.print(f"[bold cyan]-> {name}[/bold cyan][dim]({args})[/dim]")
+
     elif event.type == "tool_result":
-        print(f"  <- {event.data['content'][:200]}")
+        content = event.data["content"]
+        preview = content[:300] + ("..." if len(content) > 300 else "")
+        console.print(Panel(Text(preview), title="result", border_style="dim", expand=False))
+
     elif event.type == "cost":
-        print(f"  [tokens so far: {event.data['total_tokens']}]")
+        console.print(f"[dim]  tokens: {event.data['total_tokens']}[/dim]")
+
     elif event.type == "text":
-        print(f"\n{event.data['content']}")
+        console.print(Panel(
+            Text(event.data["content"]),
+            title="[bold green]answer[/bold green]",
+            border_style="green",
+            expand=False,
+        ))
 
 
 def main():
     messages = [build_system_prompt()]      # THE CONVERSATION — created once, survives across goals
 
-    print("FORGE — enter a goal. Commands: /exit  /clear  /tools\n")
+    console.print(Panel(
+        "[bold]FORGE[/bold] — agentic CLI\n[dim]commands: /exit  /clear  /tools[/dim]",
+        border_style="cyan", expand=False,
+    ))
 
     while True:                     # SESSION loop — one iteration per user goal
-        goal = input("goal> ").strip()
+        try:
+            goal = console.input("[bold cyan]goal>[/bold cyan] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]bye[/dim]")
+            break
 
         if goal in ("/exit", "/quit"):
+            console.print("[dim]bye[/dim]")
             break
         if goal == "/clear":
             messages = [build_system_prompt()]
-            print("(conversation cleared)\n")
+            console.print("[dim](conversation cleared)[/dim]")
             continue
         if goal == "/tools":
-            print("  tools: " + ", ".join(get_tool_names()) + "\n")
+            console.print("[bold]tools:[/bold] " + ", ".join(get_tool_names()))
             continue
         if not goal:
             continue
@@ -273,13 +303,17 @@ def main():
             if event.type == "confirm_request":
                 name = event.data["name"]
                 args = event.data["args"]
-                print(f"\n[!] Agent wants to run: {name}({args})")
-                answer = input("    Approve? [yes/no]: ").strip().lower()
+                console.print(Panel(
+                    f"[bold]{name}[/bold]([dim]{args}[/dim])",
+                    title="[bold yellow]! approve?[/bold yellow]",
+                    border_style="yellow", expand=False,
+                ))
+                answer = console.input("  [yellow]approve[/yellow] [dim][yes/no][/dim]: ").strip().lower()
                 to_send = "yes" if answer in ("yes", "y") else "no"
             else:
                 _render(event)
 
-        print()   # blank line between turns
+        console.print()   # blank line between turns
 
 
 if __name__ == "__main__":
