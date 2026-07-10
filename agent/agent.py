@@ -184,7 +184,7 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
 #  The context window is a finite cache; summarize old turns, keep recent ones.
 #  Threshold is high so it only fires on genuinely long sessions (not every turn).
 # ─────────────────────────────────────────────
-def compact(messages, client, keep_recent=6, threshold=40):
+def compact(messages, client, keep_recent=6, threshold=6):
     """If the conversation is long, summarize the older turns into one message.
     Keeps the system prompt and the most recent turns verbatim.
     Returns a new (shorter) messages list, or the original if no compaction needed."""
@@ -205,7 +205,8 @@ def compact(messages, client, keep_recent=6, threshold=40):
                                       "results the user might refer back to. Be brief."},
         {"role": "user", "content": json.dumps(to_summarize)},
     ]
-    resp = client.create(summary_request, [])   # no tools needed for summarizing
+    resp = client.create(summary_request, []) 
+    print(f"  [COMPACTING: {len(messages)} messages -> summary + {keep_recent} recent]")  # no tools needed for summarizing
     summary_text = resp.choices[0].message.content
 
     summary_msg = {
