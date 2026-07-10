@@ -48,6 +48,29 @@ class FakeClient:
         response = self._responses[self._i]
         self._i += 1
         return response
+    def create_stream(self, messages, tools):
+        resp = self._responses[self._i]
+        self._i += 1
+        m = resp.choices[0].message
+        tool_frags = None
+        if m.tool_calls:
+            tool_frags = [
+                type("TF", (), {
+                    "index": j,
+                    "id": tc.id,
+                    "function": type("F", (), {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    })(),
+                })()
+                for j, tc in enumerate(m.tool_calls)
+            ]
+        delta = type("D", (), {"content": m.content, "tool_calls": tool_frags})()
+        chunk = type("CH", (), {
+            "choices": [type("C", (), {"delta": delta})()],
+            "usage": type("U", (), {"total_tokens": 10})(),
+        })()
+        return [chunk]
 
 
 # helper: build a messages list from a goal string (run_agent now takes messages, not a goal)
@@ -59,16 +82,12 @@ def make_messages(goal):
 # TESTS
 # ─────────────────────────────────────────────
 def test_agent_returns_final_answer_with_no_tool_call():
-    # ARRANGE: model replies with text, no tool call → agent should finish immediately
     fake = FakeClient([FakeResponse(FakeMessage(content="The answer is 42."))])
-
-    # ACT
-    events = list(run_agent(make_messages("what is the answer"), fake))
-
-    # ASSERT: exactly one text (final answer) event, containing the answer
-    text_events = [e for e in events if e.type == "text"]
-    assert len(text_events) == 1
-    assert "42" in text_events[0].data["content"]
+    messages = make_messages("what is the answer")
+    list(run_agent(messages, fake))
+    # the streamed answer is appended to the conversation
+    assert messages[-1]["role"] == "assistant"
+    assert "42" in messages[-1]["content"]
 
 
 def test_agent_runs_a_tool_when_requested():
@@ -103,13 +122,21 @@ def test_agent_stops_at_max_iterations():
     class AlwaysToolClient:
         def __init__(self):
             self._n = 0
-        def create(self, messages, tools):
+        def create_stream(self, messages, tools):
             self._n += 1
-            # DIFFERENT path each call → avoids repeat-detection → truly loops to max_iterations
-            return FakeResponse(FakeMessage(
-                content=None,
-                tool_calls=[FakeToolCall("read_file", f'{{"path": "file_{self._n}.txt"}}')],
-            ))
+            frag = type("TF", (), {
+                "index": 0, "id": "call_1",
+                "function": type("F", (), {
+                    "name": "read_file",
+                    "arguments": f'{{"path": "file_{self._n}.txt"}}',
+                })(),
+            })()
+            delta = type("D", (), {"content": None, "tool_calls": [frag]})()
+            chunk = type("CH", (), {
+                "choices": [type("C", (), {"delta": delta})()],
+                "usage": type("U", (), {"total_tokens": 10})(),
+            })()
+            return [chunk]
 
     # ACT: cap iterations low so the test is fast
     events = list(run_agent(make_messages("loop forever"), AlwaysToolClient(), max_iterations=3))

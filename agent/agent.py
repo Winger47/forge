@@ -9,6 +9,8 @@ from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
+from dataclasses import dataclass, field
+
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -47,6 +49,17 @@ class DirectClient:
             tools=tools,
             temperature=0,
         )
+    def create_stream(self, messages, tools):
+        """Streaming variant. Bypasses the cache (can't stream a cached hit)."""
+        return self.client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            tools=tools,
+            temperature=0,
+            stream=True,                                # ← the streaming switch
+            stream_options={"include_usage": True},     # ← ask for token usage in the stream
+            extra_headers={"Cache-Control": "no-cache"},  # streaming bypasses cache
+        )
 
 
 class GatewayClient:
@@ -67,6 +80,17 @@ class GatewayClient:
             tools=tools,
             temperature=0,
             extra_headers=extra_headers,
+        )
+    def create_stream(self, messages, tools):
+        """Streaming variant. Bypasses the cache (can't stream a cached hit)."""
+        return self.client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            tools=tools,
+            temperature=0,
+            stream=True,                                # ← the streaming switch
+            stream_options={"include_usage": True},     # ← ask for token usage in the stream
+            extra_headers={"Cache-Control": "no-cache"},  # streaming bypasses cache
         )
 
 
@@ -105,6 +129,94 @@ def build_system_prompt():
 #    messages is OWNED BY THE SESSION and passed in — mutated in place so the
 #    conversation survives across turns.
 # ─────────────────────────────────────────────
+# from dataclasses import dataclass, field
+
+
+# ─────────────────────────────────────────────
+#  STREAMING — reassemble fragmented chunks into a complete message.
+#  Text chunks display live; tool-call chunks arrive as fragments that
+#  must be accumulated (by index) and stitched back together.
+# ─────────────────────────────────────────────
+@dataclass
+class StreamedToolCall:
+    """A reassembled tool call — mimics the SDK's tool_call shape so the loop
+    can use it unchanged (.id, .function.name, .function.arguments)."""
+    id: str
+    name: str
+    arguments: str
+
+    @property
+    def function(self):
+        # mimic tc.function.name / tc.function.arguments
+        return type("F", (), {"name": self.name, "arguments": self.arguments})()
+
+    def model_dump(self):
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments},
+        }
+
+
+@dataclass
+class StreamedMessage:
+    """A reassembled message — mimics response.choices[0].message
+    so run_agent can treat streamed and non-streamed results identically."""
+    content: str = None
+    tool_calls: list = None
+
+
+def stream_completion(client, messages, tools, on_text=None):
+    """Make a STREAMING call and reassemble the chunks into a complete message.
+
+    - text fragments are accumulated (and passed live to on_text if given)
+    - tool-call fragments are accumulated by index and stitched together
+    Returns a StreamedMessage with .content and .tool_calls, plus total_tokens.
+    """
+    stream = client.create_stream(messages, tools)
+
+    text_parts = []
+    tool_acc = {}          # index -> {"id", "name", "arguments"} being built up
+    total_tokens = 0
+
+    for chunk in stream:
+        # usage may arrive on the final chunk (depends on provider settings)
+        if getattr(chunk, "usage", None):
+            total_tokens = chunk.usage.total_tokens
+
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+
+        # --- TEXT: accumulate, and stream live if a callback was given ---
+        if getattr(delta, "content", None):
+            text_parts.append(delta.content)
+            if on_text:
+                on_text(delta.content)          # print this piece live
+
+        # --- TOOL CALLS: reassemble fragments, grouped by index ---
+        if getattr(delta, "tool_calls", None):
+            for frag in delta.tool_calls:
+                idx = frag.index
+                if idx not in tool_acc:
+                    tool_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                if frag.id:
+                    tool_acc[idx]["id"] = frag.id
+                if frag.function and frag.function.name:
+                    tool_acc[idx]["name"] += frag.function.name
+                if frag.function and frag.function.arguments:
+                    tool_acc[idx]["arguments"] += frag.function.arguments
+
+    # assemble final results
+    content = "".join(text_parts) or None
+    tool_calls = None
+    if tool_acc:
+        tool_calls = [
+            StreamedToolCall(id=v["id"], name=v["name"], arguments=v["arguments"])
+            for _, v in sorted(tool_acc.items())    # sorted by index → correct order
+        ]
+
+    return StreamedMessage(content=content, tool_calls=tool_calls), total_tokens
 def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
     total_tokens = 0
     last_call = None
@@ -112,24 +224,29 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
     for i in range(max_iterations):
         yield Event("status", {"phase": "iteration", "n": i})
 
-        # --- GUARD: token budget ---
         if total_tokens > max_tokens:
             yield Event("status", {"phase": "aborted", "reason": "token budget exceeded"})
             return
 
-        # --- THINK ---
-        response = client.create(messages, get_schemas())
-        msg = response.choices[0].message
-        total_tokens += response.usage.total_tokens
+        # --- THINK (streaming) ---
+        text_pieces = []
+        msg, call_tokens = stream_completion(
+            client, messages, get_schemas(),
+            on_text=lambda p: (text_pieces.append(p), console.print(p, end="")),
+        )
+        total_tokens += call_tokens
         yield Event("cost", {"total_tokens": total_tokens})
 
         # --- DONE? no tool call means the AI is finished ---
         if not msg.tool_calls:
             messages.append({"role": "assistant", "content": msg.content})
-            yield Event("text", {"content": msg.content})
+            if text_pieces:
+                console.print()                      # newline after streamed text
+            else:
+                yield Event("text", {"content": msg.content})
             return
 
-        # --- ACT: record the assistant tool-call message ---
+        # --- ACT ---
         messages.append({
             "role": "assistant",
             "content": msg.content,
@@ -138,10 +255,10 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
 
         for tc in msg.tool_calls:
             name = tc.function.name
-            args = json.loads(tc.function.arguments)
+            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
             call_signature = f"{name}:{json.dumps(args, sort_keys=True)}"
 
-            # --- GUARD: on a repeat, FORCE a final answer (remove ability to loop) ---
+            # --- GUARD: on a repeat, FORCE a final answer (streamed) ---
             if call_signature == last_call:
                 messages.append({
                     "role": "user",
@@ -151,13 +268,15 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
                         "using the information you already have."
                     ),
                 })
-                fresh_client = GatewayClient(bypass_cache=True)   # forced answer -> not cached
-                forced = fresh_client.create(messages, [])
-                total_tokens += forced.usage.total_tokens
-                yield Event("cost", {"total_tokens": total_tokens})
-                answer = forced.choices[0].message.content
+                fresh_client = GatewayClient(bypass_cache=True)
+                fmsg, ftok = stream_completion(
+                    fresh_client, messages, [],
+                    on_text=lambda p: console.print(p, end=""),
+                )
+                total_tokens += ftok
+                console.print()
+                answer = fmsg.content
                 messages.append({"role": "assistant", "content": answer})
-                yield Event("text", {"content": answer})
                 return
 
             # --- permission gate for dangerous tools ---
@@ -177,7 +296,7 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
             try:
                 result = get_tool(name)(**args)
             except Exception as e:
-                result = f"ERROR: {type(e).__name__}: {e}"   # tool failure = data, not a crash
+                result = f"ERROR: {type(e).__name__}: {e}"
             yield Event("tool_result", {"name": name, "content": result})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 

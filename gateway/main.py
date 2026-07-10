@@ -4,7 +4,7 @@ import time
 import hashlib
 from pathlib import Path
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer, util
@@ -79,7 +79,7 @@ def call_with_failover(body: dict):
             print(f"   [SUCCESS with {model}]")
             return response
         except Exception as e:
-            print(f"   [FAILED {model}: {e}] → failing over")
+            print(f"   [FAILED {model}: {e}] -> failing over")
             last_error = e
             continue
     raise last_error
@@ -94,6 +94,25 @@ async def chat_completions(request: Request):
         return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
 
     body = await request.json()
+
+    # --- STREAMING: forward chunks straight through, no cache ---
+    # A stream is a flow of chunks, not a complete response — it can't be cached
+    # or model_dump()'d like a normal reply. So streaming takes its own SSE path
+    # and bypasses the entire cache/failover machinery.
+    if body.get("stream"):
+        def event_stream():
+            try:
+                response = groq.chat.completions.create(**body)
+                for chunk in response:
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                print(f"STREAM ERROR: {e}")
+                yield "data: [DONE]\n\n"
+        print("STREAMING -> forwarding chunks")
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    # --- non-streaming path: bypass -> exact cache -> semantic cache -> failover ---
 
     # bypass intent must be read BEFORE the key is built...
     bypass = wants_fresh(body, request)
@@ -117,12 +136,12 @@ async def chat_completions(request: Request):
                 print(f"SEMANTIC HIT (score {score:.3f})")
                 return entry["response"]
     else:
-        print("CACHE BYPASS → forcing fresh response")
+        print("CACHE BYPASS -> forcing fresh response")
         prompt = get_prompt_text(body)
         query_vec = embedder.encode(prompt)   # bypass skips reads but still needs the vector to store
 
-    # 3. real miss (or bypass) → providers with failover
-    print("MISS → calling providers")
+    # 3. real miss (or bypass) -> providers with failover
+    print("MISS -> calling providers")
     response = call_with_failover(body)
     result = response.model_dump()
 
