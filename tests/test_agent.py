@@ -50,6 +50,11 @@ class FakeClient:
         return response
 
 
+# helper: build a messages list from a goal string (run_agent now takes messages, not a goal)
+def make_messages(goal):
+    return [{"role": "user", "content": goal}]
+
+
 # ─────────────────────────────────────────────
 # TESTS
 # ─────────────────────────────────────────────
@@ -58,7 +63,7 @@ def test_agent_returns_final_answer_with_no_tool_call():
     fake = FakeClient([FakeResponse(FakeMessage(content="The answer is 42."))])
 
     # ACT
-    events = list(run_agent("what is the answer", fake))
+    events = list(run_agent(make_messages("what is the answer"), fake))
 
     # ASSERT: exactly one text (final answer) event, containing the answer
     text_events = [e for e in events if e.type == "text"]
@@ -79,7 +84,7 @@ def test_agent_runs_a_tool_when_requested():
     ])
 
     # ACT
-    events = list(run_agent("read the test file", fake))
+    events = list(run_agent(make_messages("read the test file"), fake))
 
     # ASSERT: a tool_call event fired for read_file, and the tool actually ran (tool_result)
     tool_calls = [e for e in events if e.type == "tool_call"]
@@ -96,14 +101,18 @@ def test_agent_stops_at_max_iterations():
     # ARRANGE: model ALWAYS requests a tool → never finishes → must hit the guard.
     # A client that returns a tool-call response every single time.
     class AlwaysToolClient:
+        def __init__(self):
+            self._n = 0
         def create(self, messages, tools):
+            self._n += 1
+            # DIFFERENT path each call → avoids repeat-detection → truly loops to max_iterations
             return FakeResponse(FakeMessage(
                 content=None,
-                tool_calls=[FakeToolCall("read_file", '{"path": "tests/test_agent.py"}')],
+                tool_calls=[FakeToolCall("read_file", f'{{"path": "file_{self._n}.txt"}}')],
             ))
 
     # ACT: cap iterations low so the test is fast
-    events = list(run_agent("loop forever", AlwaysToolClient(), max_iterations=3))
+    events = list(run_agent(make_messages("loop forever"), AlwaysToolClient(), max_iterations=3))
 
     # ASSERT: the loop aborted on max iterations
     aborts = [e for e in events
@@ -123,7 +132,7 @@ def test_tool_failure_becomes_an_observation_not_a_crash():
     ])
 
     # ACT
-    events = list(run_agent("read a missing file", fake))
+    events = list(run_agent(make_messages("read a missing file"), fake))
 
     # ASSERT: a tool_result came back, and it's an ERROR string (not a crash)
     tool_results = [e for e in events if e.type == "tool_result"]
