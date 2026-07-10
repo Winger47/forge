@@ -1,0 +1,24 @@
+[project]
+name = "forge"
+version = "0.1.0"
+description = "An agentic CLI on a self-built LLM gateway"
+requires-python = ">=3.9"
+dependencies = [
+    "openai",
+    "python-dotenv",
+    "rich",
+    "redis",
+    "sentence-transformers",
+    "fastapi",
+    "uvicorn",
+]
+
+[project.scripts]
+forge = "agent.agent:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["agent", "gateway"]

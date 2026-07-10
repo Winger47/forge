@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: forge
+Version: 0.1.0
+Summary: An agentic CLI on a self-built LLM gateway
+Requires-Python: >=3.9
+Requires-Dist: openai
+Requires-Dist: python-dotenv
+Requires-Dist: rich
+Requires-Dist: redis
+Requires-Dist: sentence-transformers
+Requires-Dist: fastapi
+Requires-Dist: uvicorn
