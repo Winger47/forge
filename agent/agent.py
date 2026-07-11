@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 from dataclasses import dataclass, field
+import difflib
 
 
 load_dotenv(Path(__file__).parent.parent / ".env")
@@ -374,7 +375,20 @@ def _render(event):
             expand=False,
         ))
 
-
+def _render_diff(old_text, new_text):
+    """Show a colored diff: red removals, green additions — like git diff."""
+    diff = difflib.unified_diff(
+        old_text.splitlines(),
+        new_text.splitlines(),
+        lineterm="",
+    )
+    for line in diff:
+        if line.startswith("+") and not line.startswith("+++"):
+            console.print(f"[green]{line}[/green]")
+        elif line.startswith("-") and not line.startswith("---"):
+            console.print(f"[red]{line}[/red]")
+        elif line.startswith("@@"):
+            console.print(f"[cyan]{line}[/cyan]")
 def main():
     messages = [build_system_prompt()]      # THE CONVERSATION — created once, survives across goals
 
@@ -422,11 +436,12 @@ def main():
             if event.type == "confirm_request":
                 name = event.data["name"]
                 args = event.data["args"]
-                console.print(Panel(
-                    f"[bold]{name}[/bold]([dim]{args}[/dim])",
-                    title="[bold yellow]! approve?[/bold yellow]",
-                    border_style="yellow", expand=False,
-                ))
+                console.print(f"[bold yellow]! approve {name}?[/bold yellow]")
+                if name == "edit_file" and "old_text" in args and "new_text" in args:
+                    console.print(f"[dim]file: {args.get('path', '?')}[/dim]")
+                    _render_diff(args["old_text"], args["new_text"])
+                else:
+                    console.print(f"[dim]{args}[/dim]")
                 answer = console.input("  [yellow]approve[/yellow] [dim][yes/no][/dim]: ").strip().lower()
                 to_send = "yes" if answer in ("yes", "y") else "no"
             else:
