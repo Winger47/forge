@@ -17,6 +17,29 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 console = Console()
 
+# ── EXTERNAL TOOLS (MCP) ──────────────────────────────
+import sys
+from agent.mcp_client import MCPClient, to_openai_schema
+
+MCP_CLIENT = MCPClient(command=sys.executable, args=["-m", "mcp_server_fetch"])
+MCP_TOOLS = {}          # name -> mcp tool dict, filled at startup
+
+
+def load_mcp_tools():
+    """Discover the MCP server's tools. Failure is non-fatal — FORGE still
+    runs on its local tools if the external server is unavailable."""
+    global MCP_TOOLS
+    try:
+        MCP_TOOLS = {t["name"]: t for t in MCP_CLIENT.list_tools()}
+    except Exception as e:
+        console.print(f"[dim red]MCP unavailable: {e}[/dim red]")
+        MCP_TOOLS = {}
+
+
+def all_schemas():
+    """Local @tool schemas + discovered MCP schemas, as one uniform list."""
+    return get_schemas() + [to_openai_schema(t) for t in MCP_TOOLS.values()]
+
 
 # ─────────────────────────────────────────────
 # EVENTS (the agent announces; it never prints)
@@ -102,7 +125,7 @@ class GatewayClient:
 
 def build_system_prompt():
     """The system message. Built from the live tool registry so it never drifts."""
-    tool_names = ", ".join(get_tool_names())
+    tool_names = ", ".join(get_tool_names() + list(MCP_TOOLS.keys()))
     return {
         "role": "system",
         "content": (
@@ -232,7 +255,7 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
         # --- THINK (streaming) ---
         text_pieces = []
         msg, call_tokens = stream_completion(
-            client, messages, get_schemas(),
+            client, messages, all_schemas(),
             on_text=lambda p: (text_pieces.append(p), console.print(p, end="")),
         )
         total_tokens += call_tokens
@@ -295,7 +318,10 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
             last_call = call_signature
 
             try:
-                result = get_tool(name)(**args)
+                if name in MCP_TOOLS:
+                    result = MCP_CLIENT.call_tool(name, args)     # external, over MCP
+                else:
+                    result = get_tool(name)(**args)                # local @tool
             except Exception as e:
                 result = f"ERROR: {type(e).__name__}: {e}"
             yield Event("tool_result", {"name": name, "content": result})
@@ -390,6 +416,9 @@ def _render_diff(old_text, new_text):
         elif line.startswith("@@"):
             console.print(f"[cyan]{line}[/cyan]")
 def main():
+    load_mcp_tools()
+    if MCP_TOOLS:
+        console.print(f"[dim]mcp: {', '.join(MCP_TOOLS)}[/dim]")
     messages = [build_system_prompt()]      # THE CONVERSATION — created once, survives across goals
 
     console.print(Panel(
