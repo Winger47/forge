@@ -1,0 +1,13 @@
+
+# MCP servers FORGE connects to at startup.
+# Servers are declared by a human — the agent never installs or chooses them.
+
+[mcp.fetch]
+command = "python"
+args = ["-m", "mcp_server_fetch"]
+safe_tools = ["fetch"]        # reviewed as read-only; everything else is gated
+
+[mcp.time]
+command = "python"
+args = ["-m", "mcp_server_time"]
+safe_tools = ["get_current_time", "convert_time"]

@@ -21,37 +21,70 @@ console = Console()
 import sys
 from agent.mcp_client import MCPClient, to_openai_schema
 
-MCP_CLIENT = MCPClient(command=sys.executable, args=["-m", "mcp_server_fetch"])
-MCP_TOOLS = {}          # name -> mcp tool dict, filled at startup
+import tomllib
 
-def load_mcp_tools():
-    """Discover the MCP server's tools. Failure is non-fatal — FORGE still
-    runs on its local tools if the external server is unavailable."""
-    global MCP_TOOLS
+MCP_SERVERS = {}      # server_name -> MCPClient
+MCP_TOOLS = {}        # tool_name   -> {"server": name, "tool": {...}}
+MCP_SAFE = set()      # tool names a human declared read-only, from config
+
+
+def load_mcp_tools(config_path="forge.toml"):
+    """Read forge.toml, spawn every declared server, and merge their tools
+    into one registry — remembering WHICH server owns each tool.
+
+    A server that fails to start is skipped, not fatal: an external dependency
+    dying should cost a capability, not the whole agent.
+    """
+    global MCP_SERVERS, MCP_TOOLS, MCP_SAFE
+    MCP_SERVERS, MCP_TOOLS, MCP_SAFE = {}, {}, set()
+
     try:
-        MCP_TOOLS = {t["name"]: t for t in MCP_CLIENT.list_tools()}
-    except Exception as e:
-        console.print(f"[dim red]MCP unavailable: {e}[/dim red]")
-        MCP_TOOLS = {}
+        with open(config_path, "rb") as f:
+            config = tomllib.load(f)
+    except FileNotFoundError:
+        return                                  # no config, no MCP — fine
 
+    for server_name, spec in config.get("mcp", {}).items():
+        try:
+            client = MCPClient(command=spec["command"], args=spec.get("args", []))
+            tools = client.list_tools()
+        except Exception as e:
+            console.print(f"[dim red]mcp '{server_name}' unavailable: {e}[/dim red]")
+            continue
 
-# MCP tools we've reviewed and consider read-only/safe.
-# Anything from an external server NOT listed here requires approval —
-# unknown provenance means unknown risk, so default-deny.
-MCP_SAFE = {"fetch"}
+        MCP_SERVERS[server_name] = client
+        MCP_SAFE.update(spec.get("safe_tools", []))
+
+        for t in tools:
+            name = t["name"]
+            if name in get_tool_names():
+                console.print(f"[dim yellow]mcp '{server_name}' tool '{name}' shadows a "
+                              f"local tool — skipped[/dim yellow]")
+                continue                        # local tools win; never silently shadowed
+            if name in MCP_TOOLS:
+                console.print(f"[dim yellow]mcp '{server_name}' tool '{name}' collides with "
+                              f"'{MCP_TOOLS[name]['server']}' — skipped[/dim yellow]")
+                continue                        # first server to claim a name keeps it
+            MCP_TOOLS[name] = {"server": server_name, "tool": t}
 
 
 def needs_approval(name: str) -> bool:
-    """Local tools: use their declared danger flag.
-    MCP tools: deny by default unless explicitly allowlisted."""
+    """Local tools: their declared danger flag.
+    MCP tools: deny by default unless a human allowlisted them in config."""
     if name in MCP_TOOLS:
         return name not in MCP_SAFE
     return is_dangerous(name)
 
 
+def call_mcp_tool(name: str, args: dict):
+    """Route a tool call to the server that owns it."""
+    entry = MCP_TOOLS[name]
+    return MCP_SERVERS[entry["server"]].call_tool(name, args)
+
+
 def all_schemas():
     """Local @tool schemas + discovered MCP schemas, as one uniform list."""
-    return get_schemas() + [to_openai_schema(t) for t in MCP_TOOLS.values()]
+    return get_schemas() + [to_openai_schema(e["tool"]) for e in MCP_TOOLS.values()]
 
 
 # ─────────────────────────────────────────────
@@ -346,7 +379,7 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
 
             try:
                 if name in MCP_TOOLS:
-                    result = MCP_CLIENT.call_tool(name, args)     # external, over MCP
+                    result = call_mcp_tool(name, args)            # routed to its server
                 else:
                     result = get_tool(name)(**args)                # local @tool
             except Exception as e:
