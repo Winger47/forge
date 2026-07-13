@@ -24,7 +24,6 @@ from agent.mcp_client import MCPClient, to_openai_schema
 MCP_CLIENT = MCPClient(command=sys.executable, args=["-m", "mcp_server_fetch"])
 MCP_TOOLS = {}          # name -> mcp tool dict, filled at startup
 
-
 def load_mcp_tools():
     """Discover the MCP server's tools. Failure is non-fatal — FORGE still
     runs on its local tools if the external server is unavailable."""
@@ -34,6 +33,20 @@ def load_mcp_tools():
     except Exception as e:
         console.print(f"[dim red]MCP unavailable: {e}[/dim red]")
         MCP_TOOLS = {}
+
+
+# MCP tools we've reviewed and consider read-only/safe.
+# Anything from an external server NOT listed here requires approval —
+# unknown provenance means unknown risk, so default-deny.
+MCP_SAFE = {"fetch"}
+
+
+def needs_approval(name: str) -> bool:
+    """Local tools: use their declared danger flag.
+    MCP tools: deny by default unless explicitly allowlisted."""
+    if name in MCP_TOOLS:
+        return name not in MCP_SAFE
+    return is_dangerous(name)
 
 
 def all_schemas():
@@ -244,6 +257,8 @@ def stream_completion(client, messages, tools, on_text=None):
 def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
     total_tokens = 0
     last_call = None
+    denied_tools = set()      # tools the human refused THIS RUN — denial is per-ACTION,
+                              # not per-call, or the model reruns it with tweaked args
 
     for i in range(max_iterations):
         yield Event("status", {"phase": "iteration", "n": i})
@@ -303,10 +318,22 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
                 messages.append({"role": "assistant", "content": answer})
                 return
 
+            # --- a denial is FINAL for this run, whatever args the model invents ---
+            if name in denied_tools:
+                result = (f"{name} was already denied by the user in this session and will "
+                          f"NOT be executed with any arguments. Stop requesting it. Give your "
+                          f"final answer using what you already have, and state that the "
+                          f"action was declined.")
+                yield Event("tool_result", {"name": name, "content": result})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                last_call = call_signature
+                continue
+
             # --- permission gate for dangerous tools ---
-            if is_dangerous(name):
+            if needs_approval(name):
                 decision = yield Event("confirm_request", {"name": name, "args": args})
                 if decision != "yes":
+                    denied_tools.add(name)      # the ACTION is denied, not just this call
                     result = (f"DENIED by user: {name} was not run. "
                               "Do not request this same action again.")
                     yield Event("tool_result", {"name": name, "content": result})
