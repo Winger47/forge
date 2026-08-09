@@ -314,8 +314,11 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
             messages.append({"role": "assistant", "content": msg.content})
             if text_pieces:
                 console.print()                      # newline after streamed text
-            else:
+            elif msg.content:
                 yield Event("text", {"content": msg.content})
+            else:
+                yield Event("status", {"phase": "aborted",
+                                       "reason": "empty response from model"})
             return
 
         # --- ACT ---
@@ -429,115 +432,210 @@ def compact(messages, client, keep_recent=6, threshold=40):
 #    The agent yields plain Event objects; this decides how they LOOK.
 #    Swapping plain print() for rich touched only this layer — the loop is unchanged.
 # ─────────────────────────────────────────────
+def _fmt_args(args: dict, max_len: int = 64) -> str:
+    """Collapse a tool's args dict into one short line for the call header.
+    Long values are truncated with an ellipsis so a call fits on one row."""
+    if not args:
+        return ""
+    parts = []
+    for k, v in args.items():
+        s = str(v).replace("\n", " ⏎ ")
+        if len(s) > 32:
+            s = s[:31] + "…"
+        parts.append(f"{k}={s}")
+    joined = ", ".join(parts)
+    if len(joined) > max_len:
+        joined = joined[:max_len - 1] + "…"
+    return joined
+
+
 def _render(event):
-    """Render one event with rich styling."""
-    if event.type == "status":
-        phase = event.data["phase"]
-        n = event.data.get("n", "")
-        reason = event.data.get("reason", "")
-        if phase == "aborted":
-            console.print(f"[dim red]! aborted: {reason}[/dim red]")
-        else:
-            console.print(f"[dim]. iteration {n}[/dim]")
+    """Render one Event. Kept quiet on purpose — iteration ticks and running
+    token counts are suppressed to avoid drowning the actual work."""
+    t = event.type
 
-    elif event.type == "tool_call":
+    if t == "status":
+        if event.data["phase"] == "aborted":
+            console.print(f"  [red]✗[/red] [dim red]{event.data.get('reason', 'aborted')}[/dim red]")
+
+    elif t == "tool_call":
         name = event.data["name"]
-        args = event.data["args"]
-        console.print(f"[bold cyan]-> {name}[/bold cyan][dim]({args})[/dim]")
+        args = _fmt_args(event.data["args"])
+        args_part = f"[dim]({args})[/dim]" if args else ""
+        console.print(f"  [cyan]→[/cyan] [bold]{name}[/bold]{args_part}")
 
-    elif event.type == "tool_result":
-        content = event.data["content"]
-        preview = content[:300] + ("..." if len(content) > 300 else "")
-        console.print(Panel(Text(preview), title="result", border_style="dim", expand=False))
-
-    elif event.type == "cost":
-        console.print(f"[dim]  tokens: {event.data['total_tokens']}[/dim]")
-
-    elif event.type == "text":
+    elif t == "tool_result":
+        content = str(event.data["content"])
+        # short single-line results collapse to one indented line
+        if len(content) <= 80 and "\n" not in content:
+            console.print(f"    [dim]↳ {content}[/dim]")
+            return
+        preview = content[:400] + ("…" if len(content) > 400 else "")
         console.print(Panel(
-            Text(event.data["content"]),
-            title="[bold green]answer[/bold green]",
-            border_style="green",
+            Text(preview, style="grey70"),
+            border_style="grey30",
             expand=False,
+            padding=(0, 1),
         ))
 
-def _render_diff(old_text, new_text):
-    """Show a colored diff: red removals, green additions — like git diff."""
-    diff = difflib.unified_diff(
+    elif t == "cost":
+        pass                              # too noisy per iteration; surfaced elsewhere
+
+    elif t == "text":
+        # only reached when a final answer arrived non-streamed
+        console.print(Panel(
+            Text(event.data["content"]),
+            border_style="green",
+            expand=False,
+            padding=(0, 1),
+        ))
+
+
+def _render_diff(old_text: str, new_text: str):
+    """Colored unified diff with line-number gutter — the shape of a
+    minimal `git diff`, without the noise of headers we don't need."""
+    lines = list(difflib.unified_diff(
         old_text.splitlines(),
         new_text.splitlines(),
         lineterm="",
-    )
-    for line in diff:
-        if line.startswith("+") and not line.startswith("+++"):
-            console.print(f"[green]{line}[/green]")
-        elif line.startswith("-") and not line.startswith("---"):
-            console.print(f"[red]{line}[/red]")
-        elif line.startswith("@@"):
-            console.print(f"[cyan]{line}[/cyan]")
+        n=2,
+    ))
+    for line in lines:
+        if line.startswith(("---", "+++")):
+            continue
+        if line.startswith("@@"):
+            console.print(f"    [cyan]{line}[/cyan]")
+        elif line.startswith("+"):
+            console.print(f"    [green]+ {line[1:]}[/green]")
+        elif line.startswith("-"):
+            console.print(f"    [red]- {line[1:]}[/red]")
+        else:
+            console.print(f"    [dim]  {line[1:] if line.startswith(' ') else line}[/dim]")
+
+
+def _print_header():
+    """The banner. Small, quiet, informative — no ascii art."""
+    n_local = len(get_tool_names())
+    n_mcp = len(MCP_TOOLS)
+    tools_bit = f"{n_local} local"
+    if n_mcp:
+        tools_bit += f" · {n_mcp} mcp"
+    console.print()
+    console.print(f"  [bold cyan]forge[/bold cyan]  [dim]agentic cli · {tools_bit}[/dim]")
+    console.print(f"  [dim]/help  /tools  /clear  /exit[/dim]")
+    console.print()
+
+
+def _print_tools():
+    local = get_tool_names()
+    console.print(f"  [bold]local[/bold]  [dim]{', '.join(local)}[/dim]")
+    if MCP_TOOLS:
+        by_server: dict[str, list[str]] = {}
+        for name, entry in MCP_TOOLS.items():
+            by_server.setdefault(entry["server"], []).append(name)
+        for server, names in by_server.items():
+            console.print(f"  [bold]mcp[/bold]    [cyan]{server}[/cyan] [dim]{', '.join(names)}[/dim]")
+    console.print()
+
+
+def _print_help():
+    console.print("  [bold]commands[/bold]")
+    console.print("    [cyan]/help[/cyan]    show this list")
+    console.print("    [cyan]/tools[/cyan]   list available tools")
+    console.print("    [cyan]/clear[/cyan]   reset the conversation")
+    console.print("    [cyan]/exit[/cyan]    quit")
+    console.print()
+
+
 def main():
     load_mcp_tools()
-    if MCP_TOOLS:
-        console.print(f"[dim]mcp: {', '.join(MCP_TOOLS)}[/dim]")
-    messages = [build_system_prompt()]      # THE CONVERSATION — created once, survives across goals
+    messages = [build_system_prompt()]      # THE CONVERSATION — survives across goals
 
-    console.print(Panel(
-        "[bold]FORGE[/bold] — agentic CLI\n[dim]commands: /exit  /clear  /tools[/dim]",
-        border_style="cyan", expand=False,
-    ))
+    _print_header()
 
-    while True:                     # SESSION loop — one iteration per user goal
+    while True:                             # SESSION loop — one iteration per user goal
         try:
-            goal = console.input("[bold cyan]goal>[/bold cyan] ").strip()
+            goal = console.input("[bold cyan]▸[/bold cyan] ").strip()
         except (EOFError, KeyboardInterrupt):
-            console.print("\n[dim]bye[/dim]")
+            console.print("\n  [dim]bye[/dim]")
             break
 
         if goal in ("/exit", "/quit"):
-            console.print("[dim]bye[/dim]")
+            console.print("  [dim]bye[/dim]")
             break
         if goal == "/clear":
             messages = [build_system_prompt()]
-            console.print("[dim](conversation cleared)[/dim]")
+            console.print("  [dim]conversation cleared[/dim]\n")
             continue
         if goal == "/tools":
-            console.print("[bold]tools:[/bold] " + ", ".join(get_tool_names()))
+            _print_tools()
+            continue
+        if goal == "/help":
+            _print_help()
             continue
         if not goal:
             continue
 
-        # add the new goal to the SAME history, so the agent remembers prior turns
+        # append to the SAME history so the agent remembers prior turns
         messages.append({"role": "user", "content": goal})
-
-        # compact if the conversation has grown long (summary call must bypass cache)
+        # compact if the conversation has grown long (summary call bypasses cache)
         messages = compact(messages, GatewayClient(bypass_cache=True))
 
+        console.print()                     # breathing room before the response
         client = GatewayClient()
-        agent = run_agent(messages, client)     # pass the shared conversation IN
+        agent = run_agent(messages, client)
         to_send = None
-        while True:                             # drive the agent generator
+        final_tokens = 0
+        while True:                         # drive the agent generator
             try:
                 event = agent.send(to_send)
             except StopIteration:
                 break
             to_send = None
 
+            if event.type == "cost":
+                final_tokens = event.data["total_tokens"]
+                continue
+
             if event.type == "confirm_request":
                 name = event.data["name"]
                 args = event.data["args"]
-                console.print(f"[bold yellow]! approve {name}?[/bold yellow]")
+                console.print(f"\n  [yellow]![/yellow] [bold yellow]approve[/bold yellow] [bold]{name}[/bold]")
                 if name == "edit_file" and "old_text" in args and "new_text" in args:
-                    console.print(f"[dim]file: {args.get('path', '?')}[/dim]")
+                    console.print(f"    [dim]{args.get('path', '?')}[/dim]")
                     _render_diff(args["old_text"], args["new_text"])
                 else:
-                    console.print(f"[dim]{args}[/dim]")
-                answer = console.input("  [yellow]approve[/yellow] [dim][yes/no][/dim]: ").strip().lower()
+                    console.print(f"    [dim]{_fmt_args(args, max_len=200)}[/dim]")
+                answer = console.input("  [yellow]›[/yellow] [dim]y/n[/dim] ").strip().lower()
                 to_send = "yes" if answer in ("yes", "y") else "no"
             else:
                 _render(event)
 
-        console.print()   # blank line between turns
+        if final_tokens:
+            console.print(f"\n  [dim]· {final_tokens} tokens[/dim]")
+        console.print()
 
 
 if __name__ == "__main__":
     main()
+
+def step(self):
+    # JOB 1: assign every pending hall call to a car
+    def __init__(self, strategy, cars, hall_call):
+        self.strategy = strategy
+        self.cars = cars
+        self.hall_call = hall_call
+        self.pending: set[HallCall]
+        
+    for hall_call in hall_call.floor:                          # ← the mutate-while-iterating trap lives here
+        car = self.strategy.select_car(hall_call, self.cars)
+        car.add_target(hall_call)
+        self.pending.remove(hall_call)
+
+
+        # ??? hand the floor to the car
+        # ??? remove the call from pending
+
+    # JOB 2: advance every car one tick
+    for car in self.cars:
+        car.step()
