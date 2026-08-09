@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.concurrency import run_in_threadpool
 from dotenv import load_dotenv
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer, util
@@ -58,6 +59,36 @@ def make_cache_key(body: dict) -> str:
     return "cache:" + hashlib.sha256(stable.encode()).hexdigest()
 
 
+def semantic_scope(body: dict) -> str:
+    """What must MATCH for a semantic hit to be valid.
+
+    The embedding only captures the prompt TEXT. But two requests with identical
+    text are NOT the same question if they target a different model or expose
+    different tools — e.g. the same prompt on llama-8b vs llama-70b should not
+    share a cached answer. So a stored answer is only eligible for reuse when the
+    (model, tools) it was produced under match the incoming request's."""
+    payload = json.dumps(
+        {"model": body.get("model"), "tools": body.get("tools")},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def models_to_try(body: dict) -> list:
+    """Model order for a request: the client's requested model FIRST (so an
+    agent-side /model choice is honored), then the configured fallback chain,
+    deduped. Shared by streaming and non-streaming so both fail over the same way
+    without silently overriding the caller's model on the happy path."""
+    ordered = []
+    requested = body.get("model")
+    if requested:
+        ordered.append(requested)
+    for m in MODEL_CHAIN:
+        if m not in ordered:
+            ordered.append(m)
+    return ordered
+
+
 def wants_fresh(body: dict, request: Request) -> bool:
     """Should we bypass the cache? Mirrors HTTP's Cache-Control: no-cache.
     Two signals: the standard header, or a body flag for clients that can't set headers."""
@@ -85,39 +116,18 @@ def call_with_failover(body: dict):
     raise last_error
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    # 0. rate limit — reject before doing any work
-    client_id = request.headers.get("x-client-id", "default")
-    if not check_rate_limit(client_id):
-        print(f"RATE LIMITED: {client_id}")
-        return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
+def _blocking_completion(body: dict, bypass: bool):
+    """The full non-streaming path: exact cache -> semantic cache -> failover -> store.
 
-    body = await request.json()
+    Every step here is BLOCKING (redis I/O, embedding compute, provider HTTP).
+    It is deliberately a plain sync function so the async handler can run it via
+    run_in_threadpool — keeping the event loop free to accept other requests
+    instead of serializing everyone behind one Groq call.
 
-    # --- STREAMING: forward chunks straight through, no cache ---
-    # A stream is a flow of chunks, not a complete response — it can't be cached
-    # or model_dump()'d like a normal reply. So streaming takes its own SSE path
-    # and bypasses the entire cache/failover machinery.
-    if body.get("stream"):
-        def event_stream():
-            try:
-                response = groq.chat.completions.create(**body)
-                for chunk in response:
-                    yield f"data: {chunk.model_dump_json()}\n\n"
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                print(f"STREAM ERROR: {e}")
-                yield "data: [DONE]\n\n"
-        print("STREAMING -> forwarding chunks")
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-    # --- non-streaming path: bypass -> exact cache -> semantic cache -> failover ---
-
-    # bypass intent must be read BEFORE the key is built...
-    bypass = wants_fresh(body, request)
-    body.pop("no_cache", None)          # ...and the flag stripped BEFORE hashing, or it corrupts the key
-
+    `bypass` is decided by the caller BEFORE this runs, because it reads the
+    no_cache body flag which we strip here (stripping before hashing keeps the
+    cache key stable)."""
+    body.pop("no_cache", None)
     key = make_cache_key(body)
 
     if not bypass:
@@ -151,11 +161,9 @@ async def chat_completions(request: Request):
     return result
 
 
-@app.post("/v1/cache/invalidate")
-async def invalidate_cache(request: Request):
-    """Remove a cached entry so a wrong/stale answer isn't served again.
-    Body: same shape as the original chat request."""
-    body = await request.json()
+def _blocking_invalidate(body: dict):
+    """Blocking half of cache invalidation (redis delete + embed + O(n) scan).
+    Sync by design so the async endpoint can offload it to a thread."""
     body.pop("no_cache", None)
     key = make_cache_key(body)
 
@@ -170,3 +178,49 @@ async def invalidate_cache(request: Request):
         if util.cos_sim(query_vec, e["vector"]).item() <= SIMILARITY_THRESHOLD
     ]
     return {"exact_deleted": exact_deleted, "semantic_removed": before - len(semantic_store)}
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    # 0. rate limit — reject before doing any work. Redis I/O, so off-loop.
+    client_id = request.headers.get("x-client-id", "default")
+    if not await run_in_threadpool(check_rate_limit, client_id):
+        print(f"RATE LIMITED: {client_id}")
+        return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
+
+    body = await request.json()
+
+    # --- STREAMING: forward chunks straight through, no cache ---
+    # A stream is a flow of chunks, not a complete response — it can't be cached
+    # or model_dump()'d like a normal reply. So streaming takes its own SSE path
+    # and bypasses the entire cache/failover machinery.
+    #
+    # The generator is SYNC on purpose: Starlette iterates a sync streaming body
+    # in a threadpool (iterate_in_threadpool), so the blocking provider read here
+    # already runs off the event loop — no async client needed for correctness.
+    if body.get("stream"):
+        def event_stream():
+            try:
+                response = groq.chat.completions.create(**body)
+                for chunk in response:
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                print(f"STREAM ERROR: {e}")
+                yield "data: [DONE]\n\n"
+        print("STREAMING -> forwarding chunks")
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    # --- non-streaming path ---
+    # bypass intent is read HERE (needs the request headers + no_cache flag),
+    # then the entire blocking pipeline is offloaded to a thread in one hop.
+    bypass = wants_fresh(body, request)
+    return await run_in_threadpool(_blocking_completion, body, bypass)
+
+
+@app.post("/v1/cache/invalidate")
+async def invalidate_cache(request: Request):
+    """Remove a cached entry so a wrong/stale answer isn't served again.
+    Body: same shape as the original chat request."""
+    body = await request.json()
+    return await run_in_threadpool(_blocking_invalidate, body)
