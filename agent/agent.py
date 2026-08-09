@@ -1,5 +1,7 @@
 import os
 import json
+import subprocess
+import datetime
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -184,27 +186,61 @@ class GatewayClient:
 # ─────────────────────────────────────────────
 
 
+def _env_context() -> str:
+    """Ambient facts the model shouldn't waste tool calls figuring out.
+    Kept short — every character re-ships on every request."""
+    cwd = os.getcwd()
+    project = os.path.basename(cwd)
+    date = datetime.date.today().isoformat()
+
+    branch = ""
+    try:
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=cwd, capture_output=True, text=True, timeout=1,
+        ).stdout.strip()
+    except Exception:
+        pass
+
+    about = ""
+    for candidate in ("README.md", "readme.md", "Readme.md"):
+        p = os.path.join(cwd, candidate)
+        if os.path.isfile(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    text = f.read(1200)
+                for para in text.split("\n\n"):
+                    para = para.strip().replace("\n", " ")
+                    if para and not para.startswith("#"):
+                        about = para[:220]
+                        break
+            except Exception:
+                pass
+            break
+
+    parts = [f"cwd: {cwd}", f"project: {project}", f"date: {date}"]
+    if branch:
+        parts.append(f"branch: {branch}")
+    if about:
+        parts.append(f"about: {about}")
+    return "\n".join(parts)
+
+
 def build_system_prompt():
-    """The system message. Built from the live tool registry so it never drifts."""
+    """Lean system message. Behaviors the code already enforces (repeat guard,
+    per-run denials) are NOT restated here — the README's rule is 'guards live
+    in code, not prompts'. Environment context lets the model skip trivial
+    lookups. Tool list is here so the model sees availability without parsing
+    every schema."""
     tool_names = ", ".join(get_tool_names() + list(MCP_TOOLS.keys()))
     return {
         "role": "system",
         "content": (
-            f"You are a task-completing agent with access to these tools: {tool_names}.\n\n"
-            "HOW TO WORK:\n"
-            "- When a task needs real data about files or the system, call the appropriate "
-            "tool to get it. Do NOT guess or make up file contents — use a tool.\n"
-            "- After a tool returns its result, READ the result and decide: do you now have "
-            "enough to answer the user's goal?\n"
-            "- If YES: stop calling tools and write your final answer directly. Do NOT call "
-            "the same tool again.\n"
-            "- If NO: call another tool to get what's still missing.\n\n"
-            "IMPORTANT: Once you have the information you need, you MUST give a final text "
-            "answer instead of calling more tools. Repeating a tool you already ran will not "
-            "give new information. If a tool fails or is denied, do not retry it.\n\n"
-            "This is a MULTI-TURN conversation — the user may ask follow-up questions that "
-            "refer to earlier context (e.g. 'which of those is largest?'). Use the "
-            "conversation history to resolve such references."
+            "You are an agent that completes tasks by calling tools and writing answers. "
+            "Use tools for real data; never invent file contents. When you have enough, "
+            "stop calling tools and answer. Multi-turn — earlier messages carry context.\n\n"
+            f"ENVIRONMENT\n{_env_context()}\n\n"
+            f"TOOLS  {tool_names}"
         ),
     }
 
@@ -302,6 +338,38 @@ def stream_completion(client, messages, tools, on_text=None):
         ]
 
     return StreamedMessage(content=content, tool_calls=tool_calls), total_tokens
+
+
+TOOL_RESULT_CAP = 8000     # chars per tool result stored in messages
+
+
+def _wrap_tool_result(name: str, args: dict, result) -> str:
+    """Header line + oversize cap. Header tells the model at a glance what
+    it got (name, size, key identifier). Cap prevents a single huge read
+    from blowing the context window — the model can request a range for more."""
+    body = "" if result is None else str(result)
+    n_lines = body.count("\n") + 1 if body else 0
+
+    # highlight the most identifying arg, in preference order
+    ident = ""
+    for key in ("path", "url", "pattern", "command", "expression"):
+        if isinstance(args, dict) and key in args:
+            v = str(args[key]).replace("\n", " ")
+            if len(v) > 60:
+                v = v[:59] + "…"
+            ident = f" · {key}={v}"
+            break
+
+    truncated = ""
+    if len(body) > TOOL_RESULT_CAP:
+        omitted = len(body) - TOOL_RESULT_CAP
+        body = body[:TOOL_RESULT_CAP]
+        truncated = f" · TRUNCATED (+{omitted} chars omitted — request a range for more)"
+
+    header = f"[{name} · {n_lines} lines · {len(body)} chars{ident}{truncated}]"
+    return f"{header}\n{body}"
+
+
 def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
     total_tokens = 0
     last_call = None
@@ -419,7 +487,13 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
             except Exception as e:
                 result = f"ERROR: {type(e).__name__}: {e}"
             yield Event("tool_result", {"name": name, "content": result})
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            # For the model: wrap with a header line and cap oversize output so a
+            # single big read_file can't blow the context window. Display gets raw.
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": _wrap_tool_result(name, args, result),
+            })
 
     yield Event("status", {"phase": "aborted", "reason": "max iterations"})
 
@@ -427,13 +501,32 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
 # ─────────────────────────────────────────────
 #  COMPACTION — keep the conversation from growing unbounded.
 #  The context window is a finite cache; summarize old turns, keep recent ones.
+#  Trigger by ESTIMATED TOKENS, not message count — a single 8KB tool result
+#  is more urgent than 40 short messages.
 # ─────────────────────────────────────────────
-def compact(messages, client, keep_recent=6, threshold=40):
-    """If the conversation is long, summarize the older turns into one message.
-    Keeps the system prompt and the most recent turns verbatim."""
+def _estimate_tokens(messages: list) -> int:
+    """Rough estimate: ~4 chars per token. Fast, good enough as a trigger."""
+    total = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c) // 4
+        for tc in m.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                total += len(tc.get("function", {}).get("arguments", "")) // 4
+    return total
 
-    if len(messages) <= threshold:
+
+def compact(messages, client, keep_recent=6, token_threshold=8000):
+    """If the estimated context exceeds token_threshold, summarize older turns.
+    System prompt and the most recent `keep_recent` messages stay verbatim.
+    The summary prompt is specific: preserve facts the model will need again,
+    drop the assistant's reasoning chatter and redundant tool calls."""
+
+    if _estimate_tokens(messages) < token_threshold:
         return messages
+    if len(messages) <= keep_recent + 2:
+        return messages                    # nothing meaningful to compact yet
 
     system = messages[0]
     recent = messages[-keep_recent:]
@@ -443,9 +536,13 @@ def compact(messages, client, keep_recent=6, threshold=40):
         return messages
 
     summary_request = [
-        {"role": "system", "content": "Summarize the following conversation history concisely, "
-                                      "preserving key facts, decisions, file contents, and tool "
-                                      "results the user might refer back to. Be brief."},
+        {"role": "system", "content": (
+            "Summarize a working session between a user and an autonomous agent. "
+            "PRESERVE VERBATIM: user goals, decisions, file paths read/written, "
+            "commands run, tool results the model may need again, error messages. "
+            "DROP: verbose reasoning, repeated tool calls, filler acknowledgements. "
+            "Output as a compact numbered list of facts, most recent last. No prose intro."
+        )},
         {"role": "user", "content": json.dumps(to_summarize)},
     ]
     resp = client.create(summary_request, [])
@@ -453,8 +550,9 @@ def compact(messages, client, keep_recent=6, threshold=40):
 
     summary_msg = {
         "role": "system",
-        "content": f"[Summary of earlier conversation]\n{summary_text}",
+        "content": f"[SUMMARY of {len(to_summarize)} earlier messages]\n{summary_text}",
     }
+    console.print(f"  [dim]· compacted {len(to_summarize)} earlier messages[/dim]")
     return [system, summary_msg] + recent
 
 
@@ -544,6 +642,107 @@ def _render_diff(old_text: str, new_text: str):
             console.print(f"    [dim]  {line[1:] if line.startswith(' ') else line}[/dim]")
 
 
+# ─────────────────────────────────────────────
+#  SESSION PERSISTENCE — save/restore whole conversations to disk.
+#  Every completed turn auto-saves to sessions/last.json so `/resume` works.
+#  Named sessions via `/save <name>` and `/load <name>`.
+# ─────────────────────────────────────────────
+SESSIONS_DIR = Path.home() / ".forge" / "sessions"
+
+
+def _sanitize_session_name(name: str) -> str:
+    """Filesystem-safe name: alphanumeric, hyphen, underscore only. Capped at 64."""
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in name).strip("_")
+    return (safe[:64] or "session")
+
+
+def save_session(name: str, messages: list, model: str) -> Path:
+    """Persist a session to disk. Preserves `created` timestamp on re-save."""
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    path = SESSIONS_DIR / f"{_sanitize_session_name(name)}.json"
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    created = now
+    if path.exists():
+        try:
+            with open(path, encoding="utf-8") as f:
+                created = json.load(f).get("created", now)
+        except Exception:
+            pass
+    payload = {"model": model, "created": created, "updated": now, "messages": messages}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return path
+
+
+def load_session(name: str):
+    """Return (messages, model) or None if not found / unreadable."""
+    path = SESSIONS_DIR / f"{_sanitize_session_name(name)}.json"
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None
+    return payload.get("messages", []), payload.get("model", DEFAULT_MODEL)
+
+
+def list_sessions() -> list[dict]:
+    """Newest first. Silently skips unreadable files."""
+    if not SESSIONS_DIR.exists():
+        return []
+    out = []
+    for p in sorted(SESSIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            with open(p, encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            continue
+        out.append({
+            "name": p.stem,
+            "updated": payload.get("updated", ""),
+            "messages": len(payload.get("messages", [])),
+            "model": payload.get("model", ""),
+        })
+    return out
+
+
+def _print_sessions():
+    rows = list_sessions()
+    if not rows:
+        console.print("  [dim]no saved sessions in " + str(SESSIONS_DIR) + "[/dim]\n")
+        return
+    console.print("  [bold]sessions[/bold]  [dim](newest first)[/dim]")
+    for r in rows:
+        console.print(
+            f"    [cyan]{r['name']:<20}[/cyan] "
+            f"[dim]{r['messages']:>3} msg  ·  {r['updated']}  ·  {r['model']}[/dim]"
+        )
+    console.print(r"  [dim]usage: /load <name>  ·  /resume  ·  /save \[name][/dim]" + "\n")
+
+
+def _print_last_session_hint():
+    """One-line hint at startup so users know they can pick up where they left off."""
+    path = SESSIONS_DIR / "last.json"
+    if not path.exists():
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        n_msgs = len(payload.get("messages", []))
+        # user messages only, to give a truer sense of session length
+        n_user = sum(1 for m in payload.get("messages", []) if m.get("role") == "user")
+        updated = payload.get("updated", "")
+        if n_user == 0:
+            return
+        console.print(
+            f"  [dim]last session:[/dim] [bold]{n_user}[/bold][dim] goals · {updated}  ·  "
+            f"[/dim][cyan]/resume[/cyan][dim] to continue[/dim]"
+        )
+    except Exception:
+        pass
+
+
 def _gateway_up(host: str = "127.0.0.1", port: int = 8000, timeout: float = 0.5) -> bool:
     """TCP-probe the gateway so we can warn the user at startup instead of
     surfacing a confusing traceback on the first request."""
@@ -568,11 +767,12 @@ def _print_header(model: str = DEFAULT_MODEL):
     console.print(f"  [bold cyan]forge[/bold cyan]  [dim]agentic cli · {tools_bit}[/dim]")
     console.print(f"  [dim]model:[/dim] [bold]{model}[/bold]")
     if _gateway_up():
-        console.print(f"  [dim]gateway [green]●[/green] :8000  ·  /help  /tools  /model  /clear  /exit[/dim]")
+        console.print(f"  [dim]gateway [green]●[/green] :8000  ·  /help  /model  /sessions  /clear  /exit[/dim]")
     else:
         console.print(f"  [dim]gateway [red]●[/red] :8000  [red](unreachable — start with:[/red] "
                       f"[cyan]uvicorn gateway.main:app --port 8000[/cyan][red])[/red][/dim]")
-        console.print(f"  [dim]/help  /tools  /model  /clear  /exit[/dim]")
+        console.print(f"  [dim]/help  /model  /sessions  /clear  /exit[/dim]")
+    _print_last_session_hint()
     console.print()
 
 
@@ -605,6 +805,10 @@ def _print_help():
     console.print("    [cyan]/tools[/cyan]          list available tools")
     console.print("    [cyan]/model[/cyan]          show current model and known options")
     console.print("    [cyan]/model <name>[/cyan]   switch to a different model")
+    console.print("    [cyan]/sessions[/cyan]       list saved sessions")
+    console.print("    [cyan]/resume[/cyan]         continue the auto-saved last session")
+    console.print(r"    [cyan]/save \[name][/cyan]    save current session (default: timestamp)")
+    console.print("    [cyan]/load <name>[/cyan]    replace current session with a saved one")
     console.print("    [cyan]/clear[/cyan]          reset the conversation")
     console.print("    [cyan]/exit[/cyan]           quit")
     console.print()
@@ -647,6 +851,37 @@ def main():
             else:
                 current_model = new_model
                 console.print(f"  [dim]model →[/dim] [bold cyan]{current_model}[/bold cyan]\n")
+            continue
+        if goal == "/sessions":
+            _print_sessions()
+            continue
+        if goal == "/resume":
+            loaded = load_session("last")
+            if loaded is None:
+                console.print("  [dim red]no previous session found[/dim red]\n")
+            else:
+                messages, current_model = loaded
+                n_user = sum(1 for m in messages if m.get("role") == "user")
+                console.print(f"  [dim]resumed · {len(messages)} messages · {n_user} goals · "
+                              f"model[/dim] [bold cyan]{current_model}[/bold cyan]\n")
+            continue
+        if goal == "/save" or goal.startswith("/save "):
+            name = goal[len("/save"):].strip() or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            try:
+                path = save_session(name, messages, current_model)
+                console.print(f"  [dim]saved →[/dim] [cyan]{path.name}[/cyan]\n")
+            except Exception as e:
+                console.print(f"  [dim red]save failed: {e}[/dim red]\n")
+            continue
+        if goal.startswith("/load "):
+            name = goal[len("/load "):].strip()
+            loaded = load_session(name)
+            if loaded is None:
+                console.print(f"  [dim red]session '{name}' not found (see /sessions)[/dim red]\n")
+            else:
+                messages, current_model = loaded
+                console.print(f"  [dim]loaded '{name}' · {len(messages)} messages · "
+                              f"model[/dim] [bold cyan]{current_model}[/bold cyan]\n")
             continue
         if not goal:
             continue
@@ -693,6 +928,13 @@ def main():
 
         if final_tokens:
             console.print(f"\n  [dim]· {final_tokens} tokens · {current_model}[/dim]")
+
+        # auto-save so /resume works next launch; silent on failure
+        try:
+            save_session("last", messages, current_model)
+        except Exception:
+            pass
+
         console.print()
 
 
