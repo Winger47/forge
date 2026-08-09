@@ -104,9 +104,23 @@ class LLMClient(Protocol):
 # ─────────────────────────────────────────────
 # 1. THE AI CONNECTIONS
 # ─────────────────────────────────────────────
+DEFAULT_MODEL = "llama-3.3-70b-versatile"
+
+# Known Groq models — hint list for /model, NOT a validation gate.
+# Any string is accepted; if it's wrong, the next request will fail with the
+# provider's own error, which is better than a stale hardcoded allowlist.
+KNOWN_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+]
+
+
 class DirectClient:
     """Talks straight to Groq."""
-    def __init__(self):
+    def __init__(self, model: str = DEFAULT_MODEL):
+        self.model = model
         self.client = OpenAI(
             api_key=os.getenv("GROQ_API_KEY"),
             base_url="https://api.groq.com/openai/v1",
@@ -114,7 +128,7 @@ class DirectClient:
 
     def create(self, messages, tools):
         return self.client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=self.model,
             messages=messages,
             tools=tools,
             temperature=0,
@@ -122,7 +136,7 @@ class DirectClient:
     def create_stream(self, messages, tools):
         """Streaming variant. Bypasses the cache (can't stream a cached hit)."""
         return self.client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=self.model,
             messages=messages,
             tools=tools,
             temperature=0,
@@ -135,8 +149,9 @@ class DirectClient:
 class GatewayClient:
     """Same interface as DirectClient — but calls OUR gateway, not Groq directly.
     bypass_cache=True sends Cache-Control: no-cache so the gateway skips the cache."""
-    def __init__(self, bypass_cache: bool = False):
+    def __init__(self, bypass_cache: bool = False, model: str = DEFAULT_MODEL):
         self.bypass_cache = bypass_cache
+        self.model = model
         self.client = OpenAI(
             api_key="not-needed-yet",
             base_url="http://127.0.0.1:8000/v1",
@@ -145,7 +160,7 @@ class GatewayClient:
     def create(self, messages, tools):
         extra_headers = {"Cache-Control": "no-cache"} if self.bypass_cache else {}
         return self.client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=self.model,
             messages=messages,
             tools=tools,
             temperature=0,
@@ -154,7 +169,7 @@ class GatewayClient:
     def create_stream(self, messages, tools):
         """Streaming variant. Bypasses the cache (can't stream a cached hit)."""
         return self.client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=self.model,
             messages=messages,
             tools=tools,
             temperature=0,
@@ -301,11 +316,27 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
             return
 
         # --- THINK (streaming) ---
+        # spinner covers the dead air before the first token; it stops the
+        # moment any text streams in, or when the call returns (tool-only path).
         text_pieces = []
-        msg, call_tokens = stream_completion(
-            client, messages, all_schemas(),
-            on_text=lambda p: (text_pieces.append(p), console.print(p, end="")),
-        )
+        status = console.status("[dim]thinking…[/dim]", spinner="dots")
+        status.start()
+        spinner_stopped = [False]
+
+        def on_text(p):
+            if not spinner_stopped[0]:
+                status.stop()
+                spinner_stopped[0] = True
+            text_pieces.append(p)
+            console.print(p, end="")
+
+        try:
+            msg, call_tokens = stream_completion(
+                client, messages, all_schemas(), on_text=on_text,
+            )
+        finally:
+            if not spinner_stopped[0]:
+                status.stop()
         total_tokens += call_tokens
         yield Event("cost", {"total_tokens": total_tokens})
 
@@ -343,7 +374,7 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
                         "using the information you already have."
                     ),
                 })
-                fresh_client = GatewayClient(bypass_cache=True)
+                fresh_client = GatewayClient(bypass_cache=True, model=getattr(client, "model", DEFAULT_MODEL))
                 fmsg, ftok = stream_completion(
                     fresh_client, messages, [],
                     on_text=lambda p: console.print(p, end=""),
@@ -513,7 +544,20 @@ def _render_diff(old_text: str, new_text: str):
             console.print(f"    [dim]  {line[1:] if line.startswith(' ') else line}[/dim]")
 
 
-def _print_header():
+def _gateway_up(host: str = "127.0.0.1", port: int = 8000, timeout: float = 0.5) -> bool:
+    """TCP-probe the gateway so we can warn the user at startup instead of
+    surfacing a confusing traceback on the first request."""
+    import socket
+    with socket.socket() as s:
+        s.settimeout(timeout)
+        try:
+            s.connect((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def _print_header(model: str = DEFAULT_MODEL):
     """The banner. Small, quiet, informative — no ascii art."""
     n_local = len(get_tool_names())
     n_mcp = len(MCP_TOOLS)
@@ -522,7 +566,24 @@ def _print_header():
         tools_bit += f" · {n_mcp} mcp"
     console.print()
     console.print(f"  [bold cyan]forge[/bold cyan]  [dim]agentic cli · {tools_bit}[/dim]")
-    console.print(f"  [dim]/help  /tools  /clear  /exit[/dim]")
+    console.print(f"  [dim]model:[/dim] [bold]{model}[/bold]")
+    if _gateway_up():
+        console.print(f"  [dim]gateway [green]●[/green] :8000  ·  /help  /tools  /model  /clear  /exit[/dim]")
+    else:
+        console.print(f"  [dim]gateway [red]●[/red] :8000  [red](unreachable — start with:[/red] "
+                      f"[cyan]uvicorn gateway.main:app --port 8000[/cyan][red])[/red][/dim]")
+        console.print(f"  [dim]/help  /tools  /model  /clear  /exit[/dim]")
+    console.print()
+
+
+def _print_models(current: str):
+    """List the current model plus known Groq options. Any other name still works."""
+    console.print(f"  [bold]current[/bold]  [cyan]{current}[/cyan]")
+    console.print(f"  [bold]known[/bold]    [dim](any name is accepted — this is just a hint)[/dim]")
+    for m in KNOWN_MODELS:
+        marker = "[green]●[/green]" if m == current else "[dim]○[/dim]"
+        console.print(f"    {marker} [dim]{m}[/dim]")
+    console.print(f"  [dim]usage: /model <name>[/dim]")
     console.print()
 
 
@@ -540,18 +601,21 @@ def _print_tools():
 
 def _print_help():
     console.print("  [bold]commands[/bold]")
-    console.print("    [cyan]/help[/cyan]    show this list")
-    console.print("    [cyan]/tools[/cyan]   list available tools")
-    console.print("    [cyan]/clear[/cyan]   reset the conversation")
-    console.print("    [cyan]/exit[/cyan]    quit")
+    console.print("    [cyan]/help[/cyan]           show this list")
+    console.print("    [cyan]/tools[/cyan]          list available tools")
+    console.print("    [cyan]/model[/cyan]          show current model and known options")
+    console.print("    [cyan]/model <name>[/cyan]   switch to a different model")
+    console.print("    [cyan]/clear[/cyan]          reset the conversation")
+    console.print("    [cyan]/exit[/cyan]           quit")
     console.print()
 
 
 def main():
     load_mcp_tools()
     messages = [build_system_prompt()]      # THE CONVERSATION — survives across goals
+    current_model = DEFAULT_MODEL           # session-scoped; /model swaps it
 
-    _print_header()
+    _print_header(current_model)
 
     while True:                             # SESSION loop — one iteration per user goal
         try:
@@ -573,69 +637,64 @@ def main():
         if goal == "/help":
             _print_help()
             continue
+        if goal == "/model":
+            _print_models(current_model)
+            continue
+        if goal.startswith("/model "):
+            new_model = goal[len("/model "):].strip()
+            if not new_model:
+                _print_models(current_model)
+            else:
+                current_model = new_model
+                console.print(f"  [dim]model →[/dim] [bold cyan]{current_model}[/bold cyan]\n")
+            continue
         if not goal:
             continue
 
         # append to the SAME history so the agent remembers prior turns
         messages.append({"role": "user", "content": goal})
         # compact if the conversation has grown long (summary call bypasses cache)
-        messages = compact(messages, GatewayClient(bypass_cache=True))
+        messages = compact(messages, GatewayClient(bypass_cache=True, model=current_model))
 
         console.print()                     # breathing room before the response
-        client = GatewayClient()
+        client = GatewayClient(model=current_model)
         agent = run_agent(messages, client)
         to_send = None
         final_tokens = 0
-        while True:                         # drive the agent generator
-            try:
-                event = agent.send(to_send)
-            except StopIteration:
-                break
-            to_send = None
+        try:
+            while True:                     # drive the agent generator
+                try:
+                    event = agent.send(to_send)
+                except StopIteration:
+                    break
+                to_send = None
 
-            if event.type == "cost":
-                final_tokens = event.data["total_tokens"]
-                continue
+                if event.type == "cost":
+                    final_tokens = event.data["total_tokens"]
+                    continue
 
-            if event.type == "confirm_request":
-                name = event.data["name"]
-                args = event.data["args"]
-                console.print(f"\n  [yellow]![/yellow] [bold yellow]approve[/bold yellow] [bold]{name}[/bold]")
-                if name == "edit_file" and "old_text" in args and "new_text" in args:
-                    console.print(f"    [dim]{args.get('path', '?')}[/dim]")
-                    _render_diff(args["old_text"], args["new_text"])
+                if event.type == "confirm_request":
+                    name = event.data["name"]
+                    args = event.data["args"]
+                    console.print(f"\n  [yellow]![/yellow] [bold yellow]approve[/bold yellow] [bold]{name}[/bold]")
+                    if name == "edit_file" and "old_text" in args and "new_text" in args:
+                        console.print(f"    [dim]{args.get('path', '?')}[/dim]")
+                        _render_diff(args["old_text"], args["new_text"])
+                    else:
+                        console.print(f"    [dim]{_fmt_args(args, max_len=200)}[/dim]")
+                    answer = console.input("  [yellow]›[/yellow] [dim]y/n[/dim] ").strip().lower()
+                    to_send = "yes" if answer in ("yes", "y") else "no"
                 else:
-                    console.print(f"    [dim]{_fmt_args(args, max_len=200)}[/dim]")
-                answer = console.input("  [yellow]›[/yellow] [dim]y/n[/dim] ").strip().lower()
-                to_send = "yes" if answer in ("yes", "y") else "no"
-            else:
-                _render(event)
+                    _render(event)
+        except KeyboardInterrupt:
+            # Ctrl-C during a turn: kill this run, don't kill the session
+            agent.close()
+            console.print("\n  [dim red]✗ aborted[/dim red]")
 
         if final_tokens:
-            console.print(f"\n  [dim]· {final_tokens} tokens[/dim]")
+            console.print(f"\n  [dim]· {final_tokens} tokens · {current_model}[/dim]")
         console.print()
 
 
 if __name__ == "__main__":
     main()
-
-def step(self):
-    # JOB 1: assign every pending hall call to a car
-    def __init__(self, strategy, cars, hall_call):
-        self.strategy = strategy
-        self.cars = cars
-        self.hall_call = hall_call
-        self.pending: set[HallCall]
-        
-    for hall_call in hall_call.floor:                          # ← the mutate-while-iterating trap lives here
-        car = self.strategy.select_car(hall_call, self.cars)
-        car.add_target(hall_call)
-        self.pending.remove(hall_call)
-
-
-        # ??? hand the floor to the car
-        # ??? remove the call from pending
-
-    # JOB 2: advance every car one tick
-    for car in self.cars:
-        car.step()
