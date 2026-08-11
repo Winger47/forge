@@ -8,6 +8,7 @@ dependencies = [
     "python-dotenv",
     "rich",
     "redis",
+    "numpy",
     "sentence-transformers",
     "fastapi",
     "uvicorn",

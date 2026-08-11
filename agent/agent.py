@@ -168,6 +168,19 @@ class GatewayClient:
             temperature=0,
             extra_headers=extra_headers,
         )
+    def create_raw(self, messages, tools):
+        """Non-streaming call that ALSO returns the HTTP headers, so the caller
+        can read the gateway's X-Cache decision (HIT / SEMANTIC / MISS / BYPASS).
+        Returns (completion, cache_status)."""
+        extra_headers = {"Cache-Control": "no-cache"} if self.bypass_cache else {}
+        raw = self.client.chat.completions.with_raw_response.create(
+            model=self.model,
+            messages=messages,
+            tools=tools,
+            temperature=0,
+            extra_headers=extra_headers,
+        )
+        return raw.parse(), raw.headers.get("x-cache")
     def create_stream(self, messages, tools):
         """Streaming variant. Bypasses the cache (can't stream a cached hit)."""
         return self.client.chat.completions.create(
@@ -370,7 +383,8 @@ def _wrap_tool_result(name: str, args: dict, result) -> str:
     return f"{header}\n{body}"
 
 
-def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
+def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000,
+              stream_enabled=True):
     total_tokens = 0
     last_call = None
     denied_tools = set()      # tools the human refused THIS RUN — denial is per-ACTION,
@@ -383,28 +397,57 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000):
             yield Event("status", {"phase": "aborted", "reason": "token budget exceeded"})
             return
 
-        # --- THINK (streaming) ---
-        # spinner covers the dead air before the first token; it stops the
-        # moment any text streams in, or when the call returns (tool-only path).
+        # --- THINK ---
+        # Streaming (default): tokens display live, but the gateway bypasses the
+        # cache, so there is no hit/miss to report.
+        # Non-streaming (/stream off): the request goes THROUGH the cache, so the
+        # gateway's X-Cache decision comes back and we surface it as a cache event.
         text_pieces = []
         status = console.status("[dim]thinking…[/dim]", spinner="dots")
         status.start()
         spinner_stopped = [False]
 
-        def on_text(p):
+        def stop_spinner():
             if not spinner_stopped[0]:
                 status.stop()
                 spinner_stopped[0] = True
+
+        def on_text(p):
+            stop_spinner()
             text_pieces.append(p)
             console.print(p, end="")
 
+        stream_error = None
+        cache_status = None
         try:
-            msg, call_tokens = stream_completion(
-                client, messages, all_schemas(), on_text=on_text,
-            )
+            if stream_enabled:
+                msg, call_tokens = stream_completion(
+                    client, messages, all_schemas(), on_text=on_text,
+                )
+            else:
+                # cacheable path: one non-streamed call, read the X-Cache header
+                completion, cache_status = client.create_raw(messages, all_schemas())
+                stop_spinner()
+                msg = completion.choices[0].message
+                call_tokens = completion.usage.total_tokens if completion.usage else 0
+                if msg.content:
+                    console.print(msg.content)
+                    text_pieces.append(msg.content)   # so the DONE branch adds no extra newline
+        except Exception as e:
+            # the gateway surfaces provider failures as an error rather than a
+            # silent [DONE]; turn it into a clean abort, not a traceback.
+            stream_error = e
         finally:
-            if not spinner_stopped[0]:
-                status.stop()
+            stop_spinner()
+
+        if stream_error is not None:
+            yield Event("status", {"phase": "aborted",
+                                   "reason": f"request failed: {stream_error}"})
+            return
+
+        if cache_status:
+            yield Event("cache", {"status": cache_status})
+
         total_tokens += call_tokens
         yield Event("cost", {"total_tokens": total_tokens})
 
@@ -805,6 +848,7 @@ def _print_help():
     console.print("    [cyan]/tools[/cyan]          list available tools")
     console.print("    [cyan]/model[/cyan]          show current model and known options")
     console.print("    [cyan]/model <name>[/cyan]   switch to a different model")
+    console.print(r"    [cyan]/stream \[on|off][/cyan] toggle streaming; off shows cache HIT/MISS")
     console.print("    [cyan]/sessions[/cyan]       list saved sessions")
     console.print("    [cyan]/resume[/cyan]         continue the auto-saved last session")
     console.print(r"    [cyan]/save \[name][/cyan]    save current session (default: timestamp)")
@@ -818,6 +862,7 @@ def main():
     load_mcp_tools()
     messages = [build_system_prompt()]      # THE CONVERSATION — survives across goals
     current_model = DEFAULT_MODEL           # session-scoped; /model swaps it
+    stream_enabled = True                   # /stream toggles; off = cacheable + cache tag
 
     _print_header(current_model)
 
@@ -851,6 +896,20 @@ def main():
             else:
                 current_model = new_model
                 console.print(f"  [dim]model →[/dim] [bold cyan]{current_model}[/bold cyan]\n")
+            continue
+        if goal == "/stream" or goal.startswith("/stream "):
+            arg = goal[len("/stream"):].strip().lower()
+            if arg in ("on", "off"):
+                stream_enabled = (arg == "on")
+            elif not arg:
+                stream_enabled = not stream_enabled          # bare /stream flips it
+            else:
+                console.print("  [dim red]usage: /stream [on|off][/dim red]\n")
+                continue
+            if stream_enabled:
+                console.print("  [dim]streaming [green]on[/green] — live tokens, cache bypassed[/dim]\n")
+            else:
+                console.print("  [dim]streaming [yellow]off[/yellow] — cacheable, shows cache HIT/MISS[/dim]\n")
             continue
         if goal == "/sessions":
             _print_sessions()
@@ -893,9 +952,10 @@ def main():
 
         console.print()                     # breathing room before the response
         client = GatewayClient(model=current_model)
-        agent = run_agent(messages, client)
+        agent = run_agent(messages, client, stream_enabled=stream_enabled)
         to_send = None
         final_tokens = 0
+        cache_status = None
         try:
             while True:                     # drive the agent generator
                 try:
@@ -906,6 +966,10 @@ def main():
 
                 if event.type == "cost":
                     final_tokens = event.data["total_tokens"]
+                    continue
+
+                if event.type == "cache":
+                    cache_status = event.data["status"]
                     continue
 
                 if event.type == "confirm_request":
@@ -926,8 +990,14 @@ def main():
             agent.close()
             console.print("\n  [dim red]✗ aborted[/dim red]")
 
-        if final_tokens:
-            console.print(f"\n  [dim]· {final_tokens} tokens · {current_model}[/dim]")
+        # per-turn footer: tokens, model, and — when non-streaming — the cache decision
+        cache_tag = ""
+        if cache_status:
+            colors = {"HIT": "green", "SEMANTIC": "cyan", "MISS": "yellow", "BYPASS": "dim"}
+            c = colors.get(cache_status, "dim")
+            cache_tag = f" · cache [{c}]{cache_status}[/{c}]"
+        if final_tokens or cache_tag:
+            console.print(f"\n  [dim]· {final_tokens} tokens · {current_model}[/dim]{cache_tag}")
 
         # auto-save so /resume works next launch; silent on failure
         try:

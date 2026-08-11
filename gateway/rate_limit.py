@@ -4,11 +4,19 @@
 
 # Token-bucket as an atomic Lua script — read, refill, consume, write happen as ONE
 # indivisible operation, so concurrent requests can't both consume the last token.
+#
+# The clock is sourced from Redis's own TIME command, NOT passed in by the caller:
+# each uvicorn worker has its own wall clock, and any skew between them corrupts
+# the refill math. Redis is the single shared authority every worker already talks
+# to, so its time is the one consistent reference. (compute_bucket below still
+# takes `now` as a parameter — that's for deterministic unit testing.)
 BUCKET_LUA = """
 local key      = KEYS[1]
 local capacity = tonumber(ARGV[1])
 local refill   = tonumber(ARGV[2])
-local now      = tonumber(ARGV[3])
+
+local t   = redis.call('TIME')                       -- [seconds, microseconds]
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 
 local data   = redis.call('HMGET', key, 'tokens', 'ts')
 local tokens = tonumber(data[1])
