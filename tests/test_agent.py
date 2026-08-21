@@ -147,6 +147,44 @@ def test_agent_stops_at_max_iterations():
     assert len(aborts) == 1
 
 
+def test_forced_cycle_trips_loop_detector_and_aborts():
+    # ARRANGE: a client that ALTERNATES between two stable tool calls forever.
+    # calculate() is deterministic, so each call returns the SAME result every
+    # time — the definition of spinning. Adjacent calls differ (A,B,A,B...), so
+    # only the fingerprint detector (not the last-call guard) can catch this.
+    class AlternatingToolClient:
+        def __init__(self):
+            self._n = 0
+
+        def create_stream(self, messages, tools):
+            expr = "1+1" if self._n % 2 == 0 else "2+2"   # A, B, A, B, ...
+            self._n += 1
+            frag = type("TF", (), {
+                "index": 0, "id": f"call_{self._n}",
+                "function": type("F", (), {
+                    "name": "calculate",
+                    "arguments": f'{{"expression": "{expr}"}}',
+                })(),
+            })()
+            delta = type("D", (), {"content": None, "tool_calls": [frag]})()
+            chunk = type("CH", (), {
+                "choices": [type("C", (), {"delta": delta})()],
+                "usage": type("U", (), {"total_tokens": 10})(),
+            })()
+            return [chunk]
+
+    # ACT: give it plenty of iterations so we know the ABORT came from the
+    # detector, not from hitting max_iterations.
+    events = list(run_agent(make_messages("spin forever"),
+                            AlternatingToolClient(), max_iterations=50))
+
+    # ASSERT: aborted specifically because a loop was detected
+    reasons = [e.data.get("reason") for e in events
+               if e.type == "status" and e.data.get("phase") == "aborted"]
+    assert "loop detected" in reasons
+    assert "max iterations" not in reasons        # tripped early, well before the cap
+
+
 def test_tool_failure_becomes_an_observation_not_a_crash():
     # ARRANGE: model asks to read a file that does NOT exist → tool raises →
     #          the loop must catch it and return an ERROR observation, then finish.

@@ -12,6 +12,7 @@ dependencies = [
     "sentence-transformers",
     "fastapi",
     "uvicorn",
+    "psycopg[binary]",
 ]
 
 [project.scripts]

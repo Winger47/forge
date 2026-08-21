@@ -2,12 +2,19 @@ import os
 import json
 import subprocess
 import datetime
+import jsonschema
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Protocol
-from agent.tools import get_schemas, get_tool, is_dangerous, get_tool_names
+from agent.tools import (
+    get_schemas, get_tool, is_dangerous, get_tool_names, validate_call,
+    tool, ToolKind,
+)
+from agent.loop_detector import LoopDetector
+from agent.hooks import Hooks
+from agent.approval import decide, ApprovalMode, RUN, PROMPT, DENY
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -24,6 +31,9 @@ import sys
 from agent.mcp_client import MCPClient, to_openai_schema
 
 import tomllib
+
+# importing this registers the load_skill tool and discovers skill files
+from agent.skills import skills_catalogue
 
 MCP_SERVERS = {}      # server_name -> MCPClient
 MCP_TOOLS = {}        # tool_name   -> {"server": name, "tool": {...}}
@@ -48,7 +58,7 @@ def load_mcp_tools(config_path="forge.toml"):
 
     for server_name, spec in config.get("mcp", {}).items():
         try:
-            client = MCPClient(command=spec["command"], args=spec.get("args", []))
+            client = _build_mcp_client(spec)
             tools = client.list_tools()
         except Exception as e:
             console.print(f"[dim red]mcp '{server_name}' unavailable: {e}[/dim red]")
@@ -70,6 +80,28 @@ def load_mcp_tools(config_path="forge.toml"):
             MCP_TOOLS[name] = {"server": server_name, "tool": t}
 
 
+def _expand(mapping: dict) -> dict:
+    """Expand $VARs in a config mapping's string values from the environment, so a
+    secret (token) lives in .env and only its NAME sits in the committed config."""
+    return {k: (os.path.expandvars(v) if isinstance(v, str) else v)
+            for k, v in mapping.items()}
+
+
+def _build_mcp_client(spec: dict) -> MCPClient:
+    """Construct an MCPClient from a TOML server spec, choosing the transport:
+      - a `url` key → remote (transport defaults to 'sse', or set 'http'); auth
+        travels as HTTP `headers`
+      - a `command` key → local stdio process; secrets travel as subprocess `env`
+    """
+    if spec.get("url"):
+        headers = _expand(spec["headers"]) if "headers" in spec else None
+        return MCPClient(transport=spec.get("transport", "sse"),
+                         url=spec["url"], headers=headers)
+    env = _expand(spec["env"]) if "env" in spec else None
+    return MCPClient(transport="stdio", command=spec["command"],
+                     args=spec.get("args", []), env=env)
+
+
 def needs_approval(name: str) -> bool:
     """Local tools: their declared danger flag.
     MCP tools: deny by default unless a human allowlisted them in config."""
@@ -89,6 +121,18 @@ def all_schemas():
     return get_schemas() + [to_openai_schema(e["tool"]) for e in MCP_TOOLS.values()]
 
 
+def validate_mcp_call(name: str, args: dict):
+    """Validate an MCP tool call against the server's own inputSchema — the same
+    machine-checkable boundary local tools get, applied to remote ones so a
+    malformed call is caught before it crosses the wire."""
+    schema = MCP_TOOLS[name]["tool"].get("schema") or {"type": "object"}
+    try:
+        jsonschema.validate(instance=args, schema=schema)
+    except jsonschema.ValidationError as e:
+        return False, f"invalid arguments for {name}: {e.message}"
+    return True, None
+
+
 # ─────────────────────────────────────────────
 # EVENTS (the agent announces; it never prints)
 # ─────────────────────────────────────────────
@@ -106,16 +150,16 @@ class LLMClient(Protocol):
 # ─────────────────────────────────────────────
 # 1. THE AI CONNECTIONS
 # ─────────────────────────────────────────────
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 # Known Groq models — hint list for /model, NOT a validation gate.
 # Any string is accepted; if it's wrong, the next request will fail with the
 # provider's own error, which is better than a stale hardcoded allowlist.
+# (Groq decommissioned the llama-3.x line; these are current as of 2026-08.)
 KNOWN_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.6-27b",
 ]
 
 
@@ -150,7 +194,12 @@ class DirectClient:
 
 class GatewayClient:
     """Same interface as DirectClient — but calls OUR gateway, not Groq directly.
-    bypass_cache=True sends Cache-Control: no-cache so the gateway skips the cache."""
+    bypass_cache=True sends Cache-Control: no-cache so the gateway skips the cache.
+
+    DEGRADE-TO-PASSTHROUGH: if the gateway is unreachable, every method falls
+    back to a direct Groq call. The run loses metering/caching for that request
+    but keeps running — availability of the agent beats availability of the
+    ledger. The fallback is a plain DirectClient constructed lazily on first need."""
     def __init__(self, bypass_cache: bool = False, model: str = DEFAULT_MODEL):
         self.bypass_cache = bypass_cache
         self.model = model
@@ -158,40 +207,59 @@ class GatewayClient:
             api_key="not-needed-yet",
             base_url="http://127.0.0.1:8000/v1",
         )
+        self._direct = None       # lazily built DirectClient, only if the gateway dies
+
+    def _fallback(self):
+        """The direct-to-provider escape hatch, built once and reused."""
+        if self._direct is None:
+            self._direct = DirectClient(model=self.model)
+        return self._direct
 
     def create(self, messages, tools):
         extra_headers = {"Cache-Control": "no-cache"} if self.bypass_cache else {}
-        return self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            tools=tools,
-            temperature=0,
-            extra_headers=extra_headers,
-        )
+        try:
+            return self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                temperature=0,
+                extra_headers=extra_headers,
+            )
+        except APIConnectionError:
+            return self._fallback().create(messages, tools)   # gateway down → go direct
+
     def create_raw(self, messages, tools):
         """Non-streaming call that ALSO returns the HTTP headers, so the caller
         can read the gateway's X-Cache decision (HIT / SEMANTIC / MISS / BYPASS).
-        Returns (completion, cache_status)."""
+        Returns (completion, cache_status). On passthrough the status is DIRECT —
+        an honest signal that this request skipped the gateway entirely."""
         extra_headers = {"Cache-Control": "no-cache"} if self.bypass_cache else {}
-        raw = self.client.chat.completions.with_raw_response.create(
-            model=self.model,
-            messages=messages,
-            tools=tools,
-            temperature=0,
-            extra_headers=extra_headers,
-        )
-        return raw.parse(), raw.headers.get("x-cache")
+        try:
+            raw = self.client.chat.completions.with_raw_response.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                temperature=0,
+                extra_headers=extra_headers,
+            )
+            return raw.parse(), raw.headers.get("x-cache")
+        except APIConnectionError:
+            return self._fallback().create(messages, tools), "DIRECT"
+
     def create_stream(self, messages, tools):
         """Streaming variant. Bypasses the cache (can't stream a cached hit)."""
-        return self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            tools=tools,
-            temperature=0,
-            stream=True,                                # ← the streaming switch
-            stream_options={"include_usage": True},     # ← ask for token usage in the stream
-            extra_headers={"Cache-Control": "no-cache"},  # streaming bypasses cache
-        )
+        try:
+            return self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                temperature=0,
+                stream=True,                                # ← the streaming switch
+                stream_options={"include_usage": True},     # ← ask for token usage in the stream
+                extra_headers={"Cache-Control": "no-cache"},  # streaming bypasses cache
+            )
+        except APIConnectionError:
+            return self._fallback().create_stream(messages, tools)   # gateway down → go direct
 
 
 # ─────────────────────────────────────────────
@@ -254,8 +322,20 @@ def build_system_prompt():
             "stop calling tools and answer. Multi-turn — earlier messages carry context.\n\n"
             f"ENVIRONMENT\n{_env_context()}\n\n"
             f"TOOLS  {tool_names}"
+            + _skills_section()
         ),
     }
+
+
+def _skills_section() -> str:
+    """The on-demand skills menu. Only names + triggers ship in the prompt; the
+    body is pulled with load_skill(name) when a task matches — so an unused skill
+    costs one line here, not its whole content every turn."""
+    catalogue = skills_catalogue()
+    if not catalogue:
+        return ""
+    return ("\n\nSKILLS  (load with load_skill(name) when a task matches)\n"
+            + catalogue)
 
 
 # ─────────────────────────────────────────────
@@ -384,12 +464,30 @@ def _wrap_tool_result(name: str, args: dict, result) -> str:
 
 
 def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000,
-              stream_enabled=True):
+              stream_enabled=True, hooks: Hooks = None,
+              approval_mode: ApprovalMode = ApprovalMode.ON_REQUEST):
+    hooks = hooks or Hooks()   # no-op unless the caller injected real handlers
     total_tokens = 0
     last_call = None
     denied_tools = set()      # tools the human refused THIS RUN — denial is per-ACTION,
                               # not per-call, or the model reruns it with tweaked args
+    failed_tools = set()      # tools that ERRORed this run — drives on-failure approval
+    detector = LoopDetector()  # aborts if the agent spins on the same action+result
 
+    hooks.fire("before_run", messages=messages)
+    try:
+        yield from _run_agent_body(
+            messages, client, max_iterations, max_tokens, stream_enabled,
+            hooks, total_tokens, last_call, denied_tools, failed_tools, detector,
+            approval_mode,
+        )
+    finally:
+        hooks.fire("after_run", messages=messages)
+
+
+def _run_agent_body(messages, client, max_iterations, max_tokens, stream_enabled,
+                    hooks, total_tokens, last_call, denied_tools, failed_tools,
+                    detector, approval_mode):
     for i in range(max_iterations):
         yield Event("status", {"phase": "iteration", "n": i})
 
@@ -507,8 +605,43 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000,
                 last_call = call_signature
                 continue
 
-            # --- permission gate for dangerous tools ---
-            if needs_approval(name):
+            # --- SCHEMA VALIDATION: reject a malformed call before it runs ---
+            # Local tools validate against their registered JSON schema; MCP tools
+            # against the server's own inputSchema. Either way a bad call becomes
+            # an observation the model can fix — not a crash, and not a prompt
+            # asking the human to approve nonsense.
+            ok, err = (validate_mcp_call(name, args) if name in MCP_TOOLS
+                       else validate_call(name, args))
+            if not ok:
+                yield Event("tool_result", {"name": name, "content": f"ERROR: {err}"})
+                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                 "content": f"ERROR: {err}"})
+                last_call = call_signature
+                continue
+
+            # --- APPROVAL POLICY: run / prompt / deny per mode + ToolKind ---
+            # MCP tools keep their config-driven allowlist gating; local tools go
+            # through the ApprovalMode engine (which also runs the always-on
+            # dangerous-command / path-escape scan).
+            if name in MCP_TOOLS:
+                if approval_mode == ApprovalMode.YOLO or not needs_approval(name):
+                    verdict = RUN
+                elif approval_mode == ApprovalMode.NEVER:
+                    verdict = DENY
+                else:
+                    verdict = PROMPT
+            else:
+                verdict = decide(approval_mode, name, args, name in failed_tools)
+
+            if verdict == DENY:
+                result = (f"DENIED by policy ({approval_mode.value}): {name} was not run. "
+                          "Give your final answer using what you already have.")
+                yield Event("tool_result", {"name": name, "content": result})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                last_call = call_signature
+                continue
+
+            if verdict == PROMPT:
                 decision = yield Event("confirm_request", {"name": name, "args": args})
                 if decision != "yes":
                     denied_tools.add(name)      # the ACTION is denied, not just this call
@@ -519,6 +652,15 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000,
                     last_call = call_signature
                     continue
 
+            # --- before_tool hook: user policy gets the last word, and can VETO ---
+            if not hooks.allow_tool(name, args):
+                result = (f"BLOCKED by policy: {name} was not run "
+                          "(vetoed by a before_tool hook).")
+                yield Event("tool_result", {"name": name, "content": result})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                last_call = call_signature
+                continue
+
             yield Event("tool_call", {"name": name, "args": args})
             last_call = call_signature
 
@@ -528,7 +670,12 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000,
                 else:
                     result = get_tool(name)(**args)                # local @tool
             except Exception as e:
+                hooks.fire("on_error", name=name, args=args, error=e)
                 result = f"ERROR: {type(e).__name__}: {e}"
+            # remember a failure so `on-failure` mode prompts before a retry
+            if str(result).startswith("ERROR"):
+                failed_tools.add(name)
+            hooks.fire("after_tool", name=name, args=args, result=result)
             yield Event("tool_result", {"name": name, "content": result})
             # For the model: wrap with a header line and cap oversize output so a
             # single big read_file can't blow the context window. Display gets raw.
@@ -537,6 +684,11 @@ def run_agent(messages, client: LLMClient, max_iterations=10, max_tokens=50000,
                 "tool_call_id": tc.id,
                 "content": _wrap_tool_result(name, args, result),
             })
+
+            # --- STUCK? same (tool, args, result) recurring = spinning, not progress ---
+            if detector.record(name, args, result):
+                yield Event("status", {"phase": "aborted", "reason": "loop detected"})
+                return
 
     yield Event("status", {"phase": "aborted", "reason": "max iterations"})
 
@@ -858,11 +1010,75 @@ def _print_help():
     console.print()
 
 
+# ─────────────────────────────────────────────
+#  SUBAGENTS — a scoped child with ISOLATED context. The parent hands it a task;
+#  the child does its own read/search loop in its OWN message history; only the
+#  final answer comes back. The child's verbose exploration never enters the
+#  parent transcript (isolation) and never reaches the screen (wrapped in
+#  console.capture) — which is how you delegate without blowing the parent's
+#  context window.
+# ─────────────────────────────────────────────
+def _make_subagent_client():
+    """The child's LLM client. A seam (like LLMClient itself) so tests can inject
+    a stub without the subagent reaching for the network."""
+    return GatewayClient(model=DEFAULT_MODEL)
+
+
+@tool(kind=ToolKind.META)
+def spawn_subagent(task: str):
+    """Delegate a self-contained investigation to a scoped child agent and get
+    back ONLY its final answer. Use for read-heavy exploration (e.g. 'find where
+    X is configured and summarize how it works') so the noisy search stays out of
+    your context. The child is read-only: it cannot write files or run dangerous
+    shell commands."""
+    child_messages = [
+        {"role": "system", "content": (
+            "You are a focused investigation subagent. Use the read/search tools to "
+            "answer the task precisely, then STOP and give a concise, self-contained "
+            "answer. You cannot modify anything — investigate and report."
+        )},
+        {"role": "user", "content": task},
+    ]
+    client = _make_subagent_client()
+
+    # console.capture swallows the child's rendering so its exploration is neither
+    # printed nor mixed into the parent's output — true context isolation.
+    with console.capture():
+        agent = run_agent(
+            child_messages, client,
+            max_iterations=8, stream_enabled=False,
+            approval_mode=ApprovalMode.NEVER,     # read-only: dangerous tools are denied
+        )
+        to_send = None
+        while True:
+            try:
+                event = agent.send(to_send)
+            except StopIteration:
+                break
+            to_send = "no" if event.type == "confirm_request" else None
+
+    # the child's answer is the last assistant message in ITS OWN history
+    for msg in reversed(child_messages):
+        if msg.get("role") == "assistant" and msg.get("content"):
+            return msg["content"]
+    return "(subagent produced no answer)"
+
+
 def main():
+    from agent.config import load_config
+    from agent.tools import load_user_tools
+
+    cfg = load_config()                     # defaults < system < project TOML
+    for msg in load_user_tools():           # discover ~/.forge/tools/, isolate failures
+        console.print(f"  [dim]{msg}[/dim]")
     load_mcp_tools()
     messages = [build_system_prompt()]      # THE CONVERSATION — survives across goals
-    current_model = DEFAULT_MODEL           # session-scoped; /model swaps it
-    stream_enabled = True                   # /stream toggles; off = cacheable + cache tag
+    current_model = cfg.model               # session-scoped; /model swaps it
+    stream_enabled = cfg.stream             # /stream toggles; off = cacheable + cache tag
+    try:
+        approval_mode = ApprovalMode(cfg.approval_mode)
+    except ValueError:
+        approval_mode = ApprovalMode.ON_REQUEST
 
     _print_header(current_model)
 
@@ -952,7 +1168,9 @@ def main():
 
         console.print()                     # breathing room before the response
         client = GatewayClient(model=current_model)
-        agent = run_agent(messages, client, stream_enabled=stream_enabled)
+        agent = run_agent(messages, client, stream_enabled=stream_enabled,
+                          max_iterations=cfg.max_iterations, max_tokens=cfg.max_tokens,
+                          approval_mode=approval_mode)
         to_send = None
         final_tokens = 0
         cache_status = None

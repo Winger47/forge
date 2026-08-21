@@ -1,9 +1,11 @@
 import os
 import json
+import time
+import random
 import hashlib
 from pathlib import Path
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.concurrency import run_in_threadpool
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -12,10 +14,44 @@ import numpy as np
 import redis
 
 from gateway.rate_limit import BUCKET_LUA
+from gateway.circuit_breaker import CircuitBreaker
+from gateway import ledger
+
+# One breaker for the whole gateway, keyed per model. Trips a model out of
+# rotation after repeated failures so we fail over FAST instead of waiting on a
+# dependency we already know is down.
+breaker = CircuitBreaker(failure_threshold=3, cooldown=15.0)
+
+RETRY_ATTEMPTS = 2      # per-model retries before failing over to the next model
+
+
+def _backoff(attempt: int) -> float:
+    """Exponential backoff with jitter. The jitter is the point: without it, N
+    clients that failed together retry together and stampede the recovering
+    provider (the thundering-herd problem)."""
+    return min(0.2 * (2 ** attempt), 2.0) + random.uniform(0, 0.1)
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+def _startup():
+    ledger.init_ledger()      # create the metering table if it isn't there yet
+
+
+def _usage_from(result: dict) -> tuple[str, int, int, int]:
+    """Pull (model, prompt_tokens, completion_tokens, total_tokens) out of a
+    provider response dict. The model that actually answered lives in the
+    response (failover may have changed it), so read it from there, not the request."""
+    usage = result.get("usage") or {}
+    return (
+        result.get("model", "unknown"),
+        int(usage.get("prompt_tokens", 0)),
+        int(usage.get("completion_tokens", 0)),
+        int(usage.get("total_tokens", 0)),
+    )
 
 groq = OpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
@@ -23,7 +59,12 @@ groq = OpenAI(
 )
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
-SIMILARITY_THRESHOLD = 0.92
+# The precision/recall dial. Measured on all-MiniLM-L6-v2: genuine paraphrases of
+# the same question sit around 0.88–0.91, while different-meaning questions fall
+# to ~0.5. 0.85 sits in that gap — high enough to reject a different question
+# (poisoning guard), low enough that a real paraphrase still hits. 0.92 was too
+# aggressive and killed recall (real paraphrases missed).
+SIMILARITY_THRESHOLD = 0.85
 MAX_SEMANTIC_ENTRIES = 500        # bound the in-memory store; FIFO eviction when full
 
 # Semantic store, VECTORIZED. All vectors live in one L2-normalized matrix, so a
@@ -33,7 +74,7 @@ MAX_SEMANTIC_ENTRIES = 500        # bound the in-memory store; FIFO eviction whe
 _sem_vectors = None               # np.ndarray (N, D), normalized rows — None when empty
 _sem_meta = []                    # list of {"response", "scope"}, parallel to the rows
 
-MODEL_CHAIN = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+MODEL_CHAIN = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 
 cache = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
@@ -160,21 +201,32 @@ def wants_fresh(body: dict, request: Request) -> bool:
 def call_with_failover(body: dict):
     last_error = None
     for model in models_to_try(body):
-        try:
-            attempt = dict(body)
-            attempt["model"] = model
-            print(f"   [trying {model}]")
-            response = groq.chat.completions.create(**attempt)
-            print(f"   [SUCCESS with {model}]")
-            return response
-        except Exception as e:
-            print(f"   [FAILED {model}: {e}] -> failing over")
-            last_error = e
+        if not breaker.allow(model):
+            print(f"   [breaker OPEN for {model} — skipping]")
+            last_error = last_error or RuntimeError(f"circuit open for {model}")
             continue
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                payload = dict(body)
+                payload["model"] = model
+                print(f"   [trying {model} (attempt {attempt + 1})]")
+                response = groq.chat.completions.create(**payload)
+                breaker.record_success(model)          # healthy again → close breaker
+                print(f"   [SUCCESS with {model}]")
+                return response
+            except Exception as e:
+                last_error = e
+                breaker.record_failure(model)
+                if attempt < RETRY_ATTEMPTS - 1:
+                    delay = _backoff(attempt)
+                    print(f"   [FAILED {model}: {e}] -> retry in {delay:.2f}s")
+                    time.sleep(delay)
+                else:
+                    print(f"   [FAILED {model}: {e}] -> failing over")
     raise last_error
 
 
-def stream_with_failover(body: dict):
+def stream_with_failover(body: dict, client_id: str = "default"):
     """Yield SSE chunks with failover ACROSS models — and surface errors instead
     of swallowing them.
 
@@ -187,6 +239,10 @@ def stream_with_failover(body: dict):
     outages look to the agent like an 'empty response'."""
     last_error = None
     for model in models_to_try(body):
+        if not breaker.allow(model):
+            print(f"   [breaker OPEN for {model} — skipping stream]")
+            last_error = last_error or RuntimeError(f"circuit open for {model}")
+            continue
         attempt = dict(body)
         attempt["model"] = model
         try:
@@ -196,23 +252,44 @@ def stream_with_failover(body: dict):
         except StopIteration:
             print(f"   [stream {model}: empty] -> failing over")
             last_error = RuntimeError("empty stream from provider")
+            breaker.record_failure(model)
             continue
         except Exception as e:
             print(f"   [stream FAILED {model}: {e}] -> failing over")
             last_error = e
+            breaker.record_failure(model)
             continue
 
-        # established — committed to this model now
+        # established — committed to this model now. First token arrived, so the
+        # provider is healthy: close the breaker before we start yielding.
+        breaker.record_success(model)
         print(f"   [streaming with {model}]")
+        # A stream carries its token usage in a trailing chunk (the client asks
+        # for it via stream_options.include_usage). Capture it as it flies past so
+        # we can write ONE ledger row when the stream ends — streaming is still a
+        # real provider call and must show up in metering like any other.
+        usage = None
+        answered_model = model
+        stream_ms = ledger.timer().__enter__()
         try:
-            yield f"data: {first.model_dump_json()}\n\n"
-            for chunk in it:
+            for chunk in [first, *it]:
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
+                if getattr(chunk, "model", None):
+                    answered_model = chunk.model
                 yield f"data: {chunk.model_dump_json()}\n\n"
         except Exception as e:
             # mid-stream failure: bytes already sent, can't fail over. Report it.
             print(f"   [stream ERROR mid-flight {model}: {e}]")
             err = {"error": {"message": str(e), "type": "stream_error"}}
             yield f"data: {json.dumps(err)}\n\n"
+        stream_ms.__exit__()
+        pt = getattr(usage, "prompt_tokens", 0) if usage else 0
+        ct = getattr(usage, "completion_tokens", 0) if usage else 0
+        tt = getattr(usage, "total_tokens", 0) if usage else 0
+        ledger.record(model=answered_model, prompt_tokens=pt, completion_tokens=ct,
+                      total_tokens=tt, latency_ms=stream_ms.ms,
+                      cache_status="STREAM", client_id=client_id)
         yield "data: [DONE]\n\n"
         return
 
@@ -223,7 +300,7 @@ def stream_with_failover(body: dict):
     yield "data: [DONE]\n\n"
 
 
-def _blocking_completion(body: dict, bypass: bool):
+def _blocking_completion(body: dict, bypass: bool, client_id: str = "default"):
     """The full non-streaming path: exact cache -> semantic cache -> failover -> store.
 
     Every step here is BLOCKING (redis I/O, embedding compute, provider HTTP).
@@ -243,22 +320,36 @@ def _blocking_completion(body: dict, bypass: bool):
 
     scope = semantic_scope(body)    # model+tools this answer is valid under
 
+    def _log(result: dict, status: str, latency_ms: int):
+        """Append the ledger row for this served request. Every path that
+        RETURNS a response — cache hit or provider call — logs exactly once, so
+        the ledger reflects every request the gateway served, not only misses."""
+        model, pt, ct, tt = _usage_from(result)
+        ledger.record(model=model, prompt_tokens=pt, completion_tokens=ct,
+                      total_tokens=tt, latency_ms=latency_ms,
+                      cache_status=status, client_id=client_id)
+
     if not bypass:
         # 1. exact cache — FAST path: hash lookup only, NO embedding
-        cached = cache.get(key)
+        with ledger.timer() as t:
+            cached = cache.get(key)
         if cached is not None:
             print("CACHE HIT", key)
-            return json.loads(cached), "HIT"
+            result = json.loads(cached)
+            _log(result, "HIT", t.ms)
+            return result, "HIT"
 
         # 2. semantic cache — only now do we pay for the embedding.
         #    A hit must match BOTH the prompt (by vector) AND the scope, or we'd
         #    serve one model's answer for another model's question.
         prompt = get_prompt_text(body)
-        query_vec = embedder.encode(prompt)
-        hit = semantic_lookup(query_vec, scope)
+        with ledger.timer() as t:
+            query_vec = embedder.encode(prompt)
+            hit = semantic_lookup(query_vec, scope)
         if hit is not None:
             response, score = hit
             print(f"SEMANTIC HIT (score {score:.3f})")
+            _log(response, "SEMANTIC", t.ms)
             return response, "SEMANTIC"
         status = "MISS"
     else:
@@ -267,10 +358,13 @@ def _blocking_completion(body: dict, bypass: bool):
         query_vec = embedder.encode(prompt)   # bypass skips reads but still needs the vector to store
         status = "BYPASS"
 
-    # 3. real miss (or bypass) -> providers with failover
+    # 3. real miss (or bypass) -> providers with failover. Time ONLY the provider
+    #    round-trip — that's the latency the ledger's p95 is supposed to reflect.
     print("MISS -> calling providers")
-    response = call_with_failover(body)
+    with ledger.timer() as t:
+        response = call_with_failover(body)
     result = response.model_dump()
+    _log(result, status, t.ms)
 
     # store the fresh result so future NORMAL requests benefit (bypass refreshes, doesn't disable)
     cache.set(key, json.dumps(result), ex=3600)
@@ -317,7 +411,7 @@ async def chat_completions(request: Request):
     if body.get("stream"):
         print("STREAMING -> forwarding chunks")
         # X-Cache is honest even here: streaming never touches the cache.
-        return StreamingResponse(stream_with_failover(body),
+        return StreamingResponse(stream_with_failover(body, client_id),
                                  media_type="text/event-stream",
                                  headers={"X-Cache": "STREAM-BYPASS"})
 
@@ -325,7 +419,9 @@ async def chat_completions(request: Request):
     # bypass intent is read HERE (needs the request headers + no_cache flag),
     # then the entire blocking pipeline is offloaded to a thread in one hop.
     bypass = wants_fresh(body, request)
-    result, cache_status = await run_in_threadpool(_blocking_completion, body, bypass)
+    result, cache_status = await run_in_threadpool(
+        _blocking_completion, body, bypass, client_id
+    )
     return JSONResponse(content=result, headers={"X-Cache": cache_status})
 
 
@@ -335,3 +431,28 @@ async def invalidate_cache(request: Request):
     Body: same shape as the original chat request."""
     body = await request.json()
     return await run_in_threadpool(_blocking_invalidate, body)
+
+
+_DASHBOARD_HTML = (Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
+
+
+@app.get("/", response_class=HTMLResponse)
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    """The metrics dashboard: a read model over the ledger. It only READS the
+    projection (/v1/metrics, /v1/ledger) — fully decoupled from the write path,
+    which never serves HTML or reads these back (CQRS-lite)."""
+    return HTMLResponse(_DASHBOARD_HTML)
+
+
+@app.get("/v1/metrics")
+async def metrics():
+    """Read model over the ledger: totals, $/model, cache-hit rate, p95 latency.
+    Read-only projection — the write path (chat) never reads this back."""
+    return await run_in_threadpool(ledger.summary)
+
+
+@app.get("/v1/ledger")
+async def ledger_rows(limit: int = 50):
+    """Most-recent ledger rows — the raw request log for the dashboard."""
+    return await run_in_threadpool(ledger.recent, limit)

@@ -11,3 +11,19 @@ safe_tools = ["fetch"]        # reviewed as read-only; everything else is gated
 command = "python"
 args = ["-m", "mcp_server_time"]
 safe_tools = ["get_current_time", "convert_time"]
+
+# GitHub — the Phase 6 "connect ONE real connector" pick. This is an MCP server,
+# NOT a hand-written API client (that maintenance burden is exactly what MCP
+# removes). It activates automatically once GITHUB_PERSONAL_ACCESS_TOKEN is set in
+# .env; until then load_mcp_tools skips it (a missing token costs a capability,
+# not the whole agent). Remote streamable-HTTP transport — no local install.
+#
+# Only read-only tools are pre-approved as safe; anything that writes (open PR,
+# comment) still routes through the approval policy.
+[mcp.github]
+url = "https://api.githubcopilot.com/mcp/"
+transport = "http"
+safe_tools = ["get_issue", "list_issues", "get_pull_request", "search_repositories"]
+
+[mcp.github.headers]
+Authorization = "Bearer $GITHUB_PERSONAL_ACCESS_TOKEN"
