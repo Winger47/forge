@@ -35,6 +35,9 @@ import tomllib
 # importing this registers the load_skill tool and discovers skill files
 from agent.skills import skills_catalogue
 
+# importing this registers the repo-map tools (explain / path / query) — Phase 5.5
+import agent.repomap  # noqa: F401
+
 MCP_SERVERS = {}      # server_name -> MCPClient
 MCP_TOOLS = {}        # tool_name   -> {"server": name, "tool": {...}}
 MCP_SAFE = set()      # tool names a human declared read-only, from config
